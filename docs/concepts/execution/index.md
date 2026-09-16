@@ -182,7 +182,9 @@ Unless bypassed in `RiskEngineConfig`, the engine validates:
 - Price and trigger-price precision for the instrument.
 - Positive prices, unless the instrument allows negative prices (options, futures spreads,
   option spreads, and spot commodities).
-- Quantity precision and base-quantity minimum and maximum bounds.
+- Quantity precision and base-quantity minimum and maximum bounds. The minimum bound is skipped
+  for venues listed in `advisory_min_quantity_venues` (see
+  [Advisory minimum quantities](#advisory-minimum-quantities) below).
 - GTD orders have not already expired.
 - `reduce_only` orders do not increase the referenced position.
 - Engine-level `max_notional_per_order` limits and the instrument's `min_notional` and `max_notional` fields.
@@ -235,6 +237,37 @@ configuration.
 The simulated exchange does not interpret `close_position` or replace the placeholder with the
 open position quantity. Leave simulated backtest venues out of `full_position_exit_venues`; model
 a backtest exit with an explicit quantity and `reduce_only` instead.
+:::
+
+### Advisory minimum quantities
+
+Some venues publish an instrument's minimum quantity as guidance rather than a submission
+constraint — orders below it are still accepted and the venue is authoritative for whether a
+sub-minimum order fills. The `advisory_min_quantity_venues` setting on `RiskEngineConfig` and
+`LiveRiskEngineConfig` identifies such venues. It defaults to empty.
+
+For an instrument on a listed venue, the risk engine treats checks as follows:
+
+| Risk check                                       | Treatment |
+| ------------------------------------------------- | --------- |
+| Instrument `min_quantity`                         | Skipped, provided the quantity is positive. |
+| Instrument `max_quantity`                         | Enforced. |
+| Quantity precision and positivity                 | Enforced. |
+| Instrument `min_notional` and `max_notional`      | Enforced. |
+| Configured `max_notional_per_order`               | Enforced. |
+| Margin, balance, rate limits, trading state, GTD  | Enforced. |
+
+Unlike [whole-position conditional exits](#whole-position-conditional-exits), the opt-out applies
+to every order on a listed venue — including orders submitted as part of an order list — and to
+both the submit and modify paths, since there is no per-order precondition to satisfy.
+
+Only allowlist a venue when there is evidence the venue itself does not enforce the published
+minimum on order submission. See [Derive](../../integrations/derive.md#configuration) for a
+supported configuration.
+
+:::warning
+The simulated exchange enforces `min_quantity` unconditionally. Listing a simulated venue in
+`advisory_min_quantity_venues` makes backtests accept orders a real enforcing venue would reject.
 :::
 
 ### Trading state

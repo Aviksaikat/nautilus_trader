@@ -848,6 +848,8 @@ class LiveRiskEngineConfig:
     @property
     def full_position_exit_venues(self) -> list[model.Venue]: ...
     @property
+    def advisory_min_quantity_venues(self) -> list[model.Venue]: ...
+    @property
     def debug(self) -> bool: ...
     def __new__(
         cls,
@@ -856,6 +858,7 @@ class LiveRiskEngineConfig:
         max_order_modify_rate: str | None = None,
         max_notional_per_order: typing.Mapping[str, typing.Any] | None = None,
         full_position_exit_venues: typing.Sequence[model.Venue] | None = None,
+        advisory_min_quantity_venues: typing.Sequence[model.Venue] | None = None,
         debug: bool | None = None,
     ) -> LiveRiskEngineConfig: ...
 

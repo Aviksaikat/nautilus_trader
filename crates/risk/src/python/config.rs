@@ -105,6 +105,7 @@ impl RiskEngineConfig {
         max_order_modify_rate = None,
         max_notional_per_order = None,
         full_position_exit_venues = None,
+        advisory_min_quantity_venues = None,
         debug = None,
     ))]
     fn py_new(
@@ -113,6 +114,7 @@ impl RiskEngineConfig {
         max_order_modify_rate: Option<String>,
         max_notional_per_order: Option<HashMap<String, Py<PyAny>>>,
         full_position_exit_venues: Option<Vec<Venue>>,
+        advisory_min_quantity_venues: Option<Vec<Venue>>,
         debug: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
@@ -132,6 +134,9 @@ impl RiskEngineConfig {
         let full_position_exit_venues = full_position_exit_venues
             .map(|venues| venues.into_iter().collect())
             .unwrap_or(default.full_position_exit_venues);
+        let advisory_min_quantity_venues = advisory_min_quantity_venues
+            .map(|venues| venues.into_iter().collect())
+            .unwrap_or(default.advisory_min_quantity_venues);
 
         Self::builder()
             .bypass(bypass.unwrap_or(default.bypass))
@@ -139,6 +144,7 @@ impl RiskEngineConfig {
             .max_order_modify(max_order_modify)
             .max_notional_per_order(max_notional_per_order)
             .full_position_exit_venues(full_position_exit_venues)
+            .advisory_min_quantity_venues(advisory_min_quantity_venues)
             .debug(debug.unwrap_or(default.debug))
             .build()
             .map_err(to_pyvalue_err)
@@ -176,6 +182,18 @@ impl RiskEngineConfig {
     fn py_full_position_exit_venues(&self) -> Vec<Venue> {
         let mut venues = self
             .full_position_exit_venues
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        venues.sort_unstable();
+        venues
+    }
+
+    #[getter]
+    #[pyo3(name = "advisory_min_quantity_venues")]
+    fn py_advisory_min_quantity_venues(&self) -> Vec<Venue> {
+        let mut venues = self
+            .advisory_min_quantity_venues
             .iter()
             .copied()
             .collect::<Vec<_>>();

@@ -198,3 +198,6 @@ tests/unit_tests/persistence/catalog/
 !/test_data/nautilus/*/**.parquet
 !tests/integration_tests/adapters/betfair/responses/*.log
 !/nautilus_core/adapters/src/databento/test_data/*
+
+# Local build environment helper (not part of the project)
+.build-env.sh
