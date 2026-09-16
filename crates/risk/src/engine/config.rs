@@ -58,6 +58,12 @@ pub struct RiskEngineConfig {
     /// Validated exits skip bounds that apply only to their placeholder quantity and notional.
     #[builder(default)]
     pub full_position_exit_venues: AHashSet<Venue>,
+    /// Venues whose instrument `min_quantity` is advisory rather than venue-enforced.
+    ///
+    /// Orders on these venues skip the minimum base-quantity floor and let the venue decide.
+    /// Maximum quantity, quantity precision, and all notional bounds remain enforced.
+    #[builder(default)]
+    pub advisory_min_quantity_venues: AHashSet<Venue>,
     #[builder(default)]
     pub debug: bool,
 }
@@ -119,6 +125,44 @@ mod tests {
         let config = RiskEngineConfig::builder().build().unwrap();
 
         assert!(config.full_position_exit_venues.is_empty());
+        assert!(config.advisory_min_quantity_venues.is_empty());
+    }
+
+    #[rstest]
+    fn test_advisory_min_quantity_venues_round_trip() {
+        let venue = Venue::from("DERIVE");
+        let config = RiskEngineConfig::builder()
+            .advisory_min_quantity_venues([venue].into_iter().collect())
+            .build()
+            .unwrap();
+
+        assert!(config.advisory_min_quantity_venues.contains(&venue));
+        assert_eq!(config.advisory_min_quantity_venues.len(), 1);
+        assert!(!config.full_position_exit_venues.contains(&venue));
+    }
+
+    #[rstest]
+    fn test_advisory_min_quantity_venues_serde_default_when_absent() {
+        let config: RiskEngineConfig = serde_json::from_str("{}").unwrap();
+
+        assert!(config.advisory_min_quantity_venues.is_empty());
+    }
+
+    #[rstest]
+    fn test_advisory_min_quantity_venues_serde_round_trip() {
+        let venue = Venue::from("DERIVE");
+        let config = RiskEngineConfig::builder()
+            .advisory_min_quantity_venues([venue].into_iter().collect())
+            .build()
+            .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RiskEngineConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.advisory_min_quantity_venues,
+            config.advisory_min_quantity_venues
+        );
     }
 
     #[rstest]

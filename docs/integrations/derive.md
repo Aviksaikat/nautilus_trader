@@ -655,6 +655,29 @@ unset:
 The session key is the secp256k1 private key registered on the wallet for API signing. The
 `session_key` field is redacted in `Debug` output and Python `repr`.
 
+### Advisory minimum quantity
+
+Derive publishes each instrument's `minimum_amount` as a maker-side advisory floor; it is not
+enforced on taker order submission at the venue. By default, Nautilus's `RiskEngine` treats every
+instrument's `min_quantity` as a hard submission floor and denies sub-minimum orders locally
+before they reach Derive. Add `DERIVE_VENUE` to `advisory_min_quantity_venues` to let Derive
+decide instead:
+
+```python
+from nautilus_trader.adapters.derive import DERIVE_VENUE
+from nautilus_trader.config import LiveRiskEngineConfig
+
+risk_engine = LiveRiskEngineConfig(
+    advisory_min_quantity_venues=[DERIVE_VENUE],
+)
+```
+
+The allowlist defaults to empty. Without this entry, an order whose quantity falls below an
+instrument's `min_quantity` is denied locally even though Derive would have accepted it.
+Maximum quantity, quantity precision, and notional bounds are unaffected and remain enforced. See
+[Advisory minimum quantities](../concepts/execution/index.md#advisory-minimum-quantities) for the
+full list of checks this does and does not skip.
+
 ### Python live node
 
 Python nodes use `LiveNode.builder(...)` and pass concrete factory instances. The node supplies the

@@ -60,3 +60,4 @@ pyo3-stub-gen = { workspace = true, optional = true }
 nautilus-model = { workspace = true, features = ["test-support"] }
 
 rstest = { workspace = true }
+serde_json = { workspace = true }

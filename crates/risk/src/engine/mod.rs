@@ -567,6 +567,18 @@ impl RiskEngine {
             full_position_exit_venues.join(","),
         );
 
+        let mut advisory_min_quantity_venues = self
+            .config
+            .advisory_min_quantity_venues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        advisory_min_quantity_venues.sort_unstable();
+        map.insert(
+            "advisory_min_quantity_venues".to_string(),
+            advisory_min_quantity_venues.join(","),
+        );
+
         map.insert("debug".to_string(), self.config.debug.to_string());
         map
     }
@@ -722,6 +734,12 @@ impl RiskEngine {
         ) && order.trigger_price().is_some()
             && order.is_reduce_only()
             && order.quantity().is_positive()
+    }
+
+    fn is_min_quantity_advisory(&self, instrument: &InstrumentAny) -> bool {
+        self.config
+            .advisory_min_quantity_venues
+            .contains(&instrument.id().venue)
     }
 
     fn is_reducing_submission(&self, command: &SubmitOrder, order: &OrderAny) -> bool {
@@ -1019,6 +1037,7 @@ impl RiskEngine {
             command.quantity,
             order.is_quote_quantity(),
             false,
+            self.is_min_quantity_advisory(&instrument),
         );
 
         if let Some(reason) = reason {
@@ -1115,6 +1134,7 @@ impl RiskEngine {
             Some(order.quantity()),
             order.is_quote_quantity(),
             full_position_exit,
+            self.is_min_quantity_advisory(instrument),
         );
 
         if let Some(reason) = reason {
@@ -1186,6 +1206,8 @@ impl RiskEngine {
             };
             max_notional = Some(max_notional_value);
         }
+
+        let min_quantity_advisory = self.is_min_quantity_advisory(instrument);
 
         let mut market_prices = Vec::with_capacity(orders.len());
 
@@ -1555,7 +1577,8 @@ impl RiskEngine {
                     return false; // Denied
                 }
 
-                if let Some(min_quantity) = instrument.min_quantity()
+                if !(min_quantity_advisory && effective_quantity.is_positive())
+                    && let Some(min_quantity) = instrument.min_quantity()
                     && effective_quantity < min_quantity
                 {
                     self.deny_order(
@@ -2142,6 +2165,7 @@ impl RiskEngine {
         quantity: Option<Quantity>,
         is_quote_quantity: bool,
         full_position_exit: bool,
+        min_quantity_advisory: bool,
     ) -> Option<OrderDeniedReason> {
         let quantity_val = quantity?;
 
@@ -2170,8 +2194,12 @@ impl RiskEngine {
             });
         }
 
-        // Check minimum quantity
-        if let Some(min_quantity) = instrument.min_quantity()
+        // Check minimum quantity. Venues in `advisory_min_quantity_venues` publish
+        // `min_quantity` as guidance rather than a submission constraint; the venue is
+        // authoritative for sub-minimum orders. A non-positive quantity still fails the
+        // floor so the bypass cannot admit a zero-quantity modification.
+        if !(min_quantity_advisory && quantity_val.is_positive())
+            && let Some(min_quantity) = instrument.min_quantity()
             && quantity_val < min_quantity
         {
             return Some(OrderDeniedReason::QuantityBelowMinimum {

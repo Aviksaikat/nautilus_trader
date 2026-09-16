@@ -199,6 +199,7 @@ fn test_deny_order_exceeding_max_notional(
         max_order_modify: RateLimit::new(5, DurationNanos::new(1000)),
         max_notional_per_order: AHashMap::new(),
         full_position_exit_venues: AHashSet::new(),
+        advisory_min_quantity_venues: AHashSet::new(),
     };
 
     let mut risk_engine = get_risk_engine(
@@ -353,6 +354,7 @@ fn config_fixture(
         max_order_modify,
         max_notional_per_order,
         full_position_exit_venues: AHashSet::new(),
+        advisory_min_quantity_venues: AHashSet::new(),
     }
 }
 
@@ -466,6 +468,7 @@ fn get_risk_engine(
         max_order_modify: RateLimit::new(5, DurationNanos::new(1000)),
         max_notional_per_order: AHashMap::new(),
         full_position_exit_venues: AHashSet::new(),
+        advisory_min_quantity_venues: AHashSet::new(),
     });
     let clock = clock.unwrap_or(Rc::new(RefCell::new(VirtualClock::new())));
     let portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
@@ -483,6 +486,23 @@ fn get_risk_engine_for_full_position_exit(
         max_order_modify: RateLimit::new(5, DurationNanos::new(1000)),
         max_notional_per_order: AHashMap::new(),
         full_position_exit_venues: [venue].into_iter().collect(),
+        advisory_min_quantity_venues: AHashSet::new(),
+    };
+    get_risk_engine(cache, Some(config), None, false)
+}
+
+fn get_risk_engine_for_advisory_min_quantity(
+    cache: Option<Rc<RefCell<Cache>>>,
+    venue: Venue,
+) -> RiskEngine {
+    let config = RiskEngineConfig {
+        debug: true,
+        bypass: false,
+        max_order_submit: RateLimit::new(10, DurationNanos::new(1000)),
+        max_order_modify: RateLimit::new(5, DurationNanos::new(1000)),
+        max_notional_per_order: AHashMap::new(),
+        full_position_exit_venues: AHashSet::new(),
+        advisory_min_quantity_venues: [venue].into_iter().collect(),
     };
     get_risk_engine(cache, Some(config), None, false)
 }
@@ -2272,6 +2292,502 @@ fn test_submit_order_when_invalid_quantity_less_than_minimum_then_denies(
     assert_eq!(
         saved_process_messages.first().unwrap().message().unwrap(),
         Ustr::from("QUANTITY_BELOW_MINIMUM: effective=1, min=100")
+    );
+}
+
+#[rstest]
+fn test_submit_sub_minimum_quantity_on_advisory_venue_is_forwarded(
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    cash_account_state_million_usd: AccountState,
+    quote_audusd: QuoteTick,
+    mut simple_cache: Cache,
+) {
+    // `instrument_audusd` has min_quantity=100 (see
+    // `test_submit_order_when_invalid_quantity_less_than_minimum_then_denies` above, which
+    // denies this exact scenario on a non-advisory venue). Here the order's venue is opted
+    // into `advisory_min_quantity_venues`, so the sub-minimum quantity must reach execution
+    // instead of being denied by either RiskEngine enforcement point
+    // (`check_quantity` and `check_orders_risk_for_account`).
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(
+            cash_account_state_million_usd,
+        )))
+        .unwrap();
+    simple_cache.add_quote(quote_audusd).unwrap();
+
+    let mut risk_engine = get_risk_engine_for_advisory_min_quantity(
+        Some(Rc::new(RefCell::new(simple_cache))),
+        instrument_audusd.id().venue,
+    );
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from_str("1").unwrap())
+        .build();
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_audusd.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None, // params
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None, // correlation_id
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    assert!(
+        saved_process_messages.is_empty(),
+        "Order should not be denied on an advisory min-quantity venue"
+    );
+
+    let execute_messages = get_execute_order_event_handler_messages(&execute_order_event_handler);
+    assert_eq!(
+        execute_messages.len(),
+        1,
+        "Order must actually reach execution, not just avoid denial"
+    );
+    let TradingCommand::SubmitOrder(forwarded) = &execute_messages[0] else {
+        panic!("Expected SubmitOrder command");
+    };
+    assert_eq!(forwarded.client_order_id, order.client_order_id());
+}
+
+#[rstest]
+fn test_advisory_min_quantity_venue_still_enforces_max_quantity(
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    cash_account_state_million_usd: AccountState,
+    quote_audusd: QuoteTick,
+    mut simple_cache: Cache,
+) {
+    // The advisory bypass must only skip the minimum bound. `instrument_audusd` has
+    // max_quantity=1000000; submitting above it on an advisory venue must still deny.
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(
+            cash_account_state_million_usd,
+        )))
+        .unwrap();
+    simple_cache.add_quote(quote_audusd).unwrap();
+
+    let mut risk_engine = get_risk_engine_for_advisory_min_quantity(
+        Some(Rc::new(RefCell::new(simple_cache))),
+        instrument_audusd.id().venue,
+    );
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from_str("2000000").unwrap())
+        .build();
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_audusd.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None, // params
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None, // correlation_id
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    assert_eq!(saved_process_messages.len(), 1);
+    assert_eq!(
+        saved_process_messages.first().unwrap().event_type(),
+        OrderEventType::Denied
+    );
+    assert_eq!(
+        saved_process_messages.first().unwrap().message().unwrap(),
+        Ustr::from("QUANTITY_EXCEEDS_MAXIMUM: effective=2000000, max=1000000")
+    );
+}
+
+#[rstest]
+fn test_advisory_min_quantity_venue_still_enforces_quantity_precision(
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    cash_account_state_million_usd: AccountState,
+    quote_audusd: QuoteTick,
+    mut simple_cache: Cache,
+) {
+    // `instrument_audusd` has size_precision=0; a fractional quantity must still be denied
+    // for precision on an advisory venue, even though it is also below min_quantity.
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(
+            cash_account_state_million_usd,
+        )))
+        .unwrap();
+    simple_cache.add_quote(quote_audusd).unwrap();
+
+    let mut risk_engine = get_risk_engine_for_advisory_min_quantity(
+        Some(Rc::new(RefCell::new(simple_cache))),
+        instrument_audusd.id().venue,
+    );
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from_str("1.5").unwrap())
+        .build();
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_audusd.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None, // params
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None, // correlation_id
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    assert_eq!(saved_process_messages.len(), 1);
+    assert_eq!(
+        saved_process_messages.first().unwrap().event_type(),
+        OrderEventType::Denied
+    );
+    assert!(
+        saved_process_messages
+            .first()
+            .unwrap()
+            .message()
+            .unwrap()
+            .as_str()
+            .starts_with("QUANTITY_PRECISION_EXCEEDS_MAXIMUM")
+    );
+}
+
+#[rstest]
+fn test_advisory_min_quantity_venue_with_quote_quantity_unchanged(
+    #[values(true, false)] venue_is_advisory: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    mut simple_cache: Cache,
+) {
+    // Quote-denominated orders already skip base-quantity bounds entirely (see
+    // `test_submit_order_with_quote_quantity_does_not_deny_on_base_min_quantity` below).
+    // The advisory bypass must not change that outcome either way — pins the absence of
+    // interaction between `is_quote_quantity` and `min_quantity_advisory`.
+    let btc_usdt = InstrumentAny::CurrencyPair(
+        CurrencyPair::builder()
+            .instrument_id(InstrumentId::from("BTCUSDT-SPOT.BYBIT"))
+            .raw_symbol(Symbol::from("BTCUSDT"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USDT())
+            .price_precision(1)
+            .size_precision(6)
+            .price_increment(Price::from("0.1"))
+            .size_increment(Quantity::from("0.000001"))
+            .multiplier(Quantity::from("1"))
+            .lot_size(Quantity::from("0.000001"))
+            .min_quantity(Quantity::from("5"))
+            .min_notional(Money::from("1 USDT"))
+            .margin_init(dec!(0.1))
+            .margin_maint(dec!(0.1))
+            .maker_fee(dec!(-0.00005))
+            .taker_fee(dec!(0.00015))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    );
+
+    simple_cache.add_instrument(btc_usdt.clone()).unwrap();
+
+    let usdt_account_state = AccountState::new(
+        AccountId::from("BYBIT-001"),
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from("1000000 USDT"),
+            Money::from("0 USDT"),
+            Money::from("1000000 USDT"),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::from(0),
+        UnixNanos::from(0),
+        Some(Currency::USDT()),
+    );
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(usdt_account_state)))
+        .unwrap();
+
+    let quote = QuoteTick::new(
+        btc_usdt.id(),
+        Price::from("100000.0"),
+        Price::from("99999.9"),
+        Quantity::from("1.0"),
+        Quantity::from("1.0"),
+        UnixNanos::from(0),
+        UnixNanos::from(0),
+    );
+    simple_cache.add_quote(quote).unwrap();
+
+    let cache_rc = Some(Rc::new(RefCell::new(simple_cache)));
+    let mut risk_engine = if venue_is_advisory {
+        get_risk_engine_for_advisory_min_quantity(cache_rc, btc_usdt.id().venue)
+    } else {
+        get_risk_engine(cache_rc, None, None, false)
+    };
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(btc_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("10"))
+        .quote_quantity(true)
+        .build();
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let submit_order = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        btc_usdt.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None, // correlation_id
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    assert_eq!(
+        saved_process_messages.len(),
+        0,
+        "Quote-quantity outcome must be identical regardless of advisory venue membership"
+    );
+}
+
+#[rstest]
+fn test_modify_order_to_sub_minimum_quantity_on_advisory_venue_is_accepted(
+    #[values(true, false)] venue_is_advisory: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    cash_account_state_million_usd: AccountState,
+    quote_audusd: QuoteTick,
+    mut simple_cache: Cache,
+) {
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(
+            cash_account_state_million_usd,
+        )))
+        .unwrap();
+    simple_cache.add_quote(quote_audusd).unwrap();
+
+    let cache_rc = Some(Rc::new(RefCell::new(simple_cache)));
+    let mut risk_engine = if venue_is_advisory {
+        get_risk_engine_for_advisory_min_quantity(cache_rc, instrument_audusd.id().venue)
+    } else {
+        get_risk_engine(cache_rc, None, None, false)
+    };
+
+    // A resting order at a valid (>=100) quantity, modified down to a sub-minimum quantity.
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1.0"))
+        .quantity(Quantity::from_str("200").unwrap())
+        .build();
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let modify_order = ModifyOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_audusd.id(),
+        order.client_order_id(),
+        order.venue_order_id(),
+        Some(Quantity::from_str("1").unwrap()),
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None, // params
+        None, // correlation_id
+    );
+
+    risk_engine.execute(TradingCommand::ModifyOrder(modify_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+
+    if venue_is_advisory {
+        assert!(
+            saved_process_messages.is_empty(),
+            "Modify to a sub-minimum quantity must be accepted on an advisory venue"
+        );
+    } else {
+        assert_eq!(saved_process_messages.len(), 1);
+        assert_eq!(
+            saved_process_messages.first().unwrap().event_type(),
+            OrderEventType::ModifyRejected
+        );
+        assert_eq!(
+            saved_process_messages.first().unwrap().message().unwrap(),
+            Ustr::from("QUANTITY_BELOW_MINIMUM: effective=1, min=100")
+        );
+    }
+}
+
+#[rstest]
+fn test_modify_order_to_zero_quantity_still_rejected_on_advisory_venue(
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    cash_account_state_million_usd: AccountState,
+    quote_audusd: QuoteTick,
+    mut simple_cache: Cache,
+) {
+    // The advisory bypass exempts sub-minimum *positive* quantities only; it must not open
+    // a path to a zero-quantity modify (pre-existing gap for instruments with no
+    // `min_quantity` at all — out of scope here, see PR description).
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    simple_cache
+        .add_account(AccountAny::Cash(cash_account(
+            cash_account_state_million_usd,
+        )))
+        .unwrap();
+    simple_cache.add_quote(quote_audusd).unwrap();
+
+    let mut risk_engine = get_risk_engine_for_advisory_min_quantity(
+        Some(Rc::new(RefCell::new(simple_cache))),
+        instrument_audusd.id().venue,
+    );
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1.0"))
+        .quantity(Quantity::from_str("200").unwrap())
+        .build();
+
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let modify_order = ModifyOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_audusd.id(),
+        order.client_order_id(),
+        order.venue_order_id(),
+        Some(Quantity::from_str("0").unwrap()),
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None, // params
+        None, // correlation_id
+    );
+
+    risk_engine.execute(TradingCommand::ModifyOrder(modify_order));
+
+    let saved_process_messages =
+        get_process_order_event_handler_messages(&process_order_event_handler);
+    assert_eq!(saved_process_messages.len(), 1);
+    assert_eq!(
+        saved_process_messages.first().unwrap().event_type(),
+        OrderEventType::ModifyRejected
+    );
+    assert_eq!(
+        saved_process_messages.first().unwrap().message().unwrap(),
+        Ustr::from("QUANTITY_BELOW_MINIMUM: effective=0, min=100")
     );
 }
 
@@ -8076,6 +8592,7 @@ fn test_set_trading_state_publishes_trading_state_changed_event() {
         max_order_modify: RateLimit::new(50, DurationNanos::from_secs(1)),
         max_notional_per_order: AHashMap::new(),
         full_position_exit_venues: [Venue::from("BINANCE")].into_iter().collect(),
+        advisory_min_quantity_venues: [Venue::from("DERIVE")].into_iter().collect(),
     };
 
     let mut risk_engine = get_risk_engine(None, Some(config), None, false);
@@ -8102,6 +8619,7 @@ fn test_set_trading_state_publishes_trading_state_changed_event() {
     assert_eq!(event.config["max_order_submit_rate"], "100/00:00:01");
     assert_eq!(event.config["max_order_modify_rate"], "50/00:00:01");
     assert_eq!(event.config["full_position_exit_venues"], "BINANCE");
+    assert_eq!(event.config["advisory_min_quantity_venues"], "DERIVE");
     assert_eq!(event.config["debug"], "true");
     assert_eq!(event.config["max_notional_per_order.AUD/USD.SIM"], "500000");
 }
@@ -8143,6 +8661,7 @@ fn test_reset_restores_trading_state_and_config_notionals() {
         max_order_modify: RateLimit::new(5, DurationNanos::new(1000)),
         max_notional_per_order: config_notionals,
         full_position_exit_venues: AHashSet::new(),
+        advisory_min_quantity_venues: AHashSet::new(),
     };
 
     let mut risk_engine = get_risk_engine(None, Some(config), None, false);
