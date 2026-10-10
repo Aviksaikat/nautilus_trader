@@ -135,6 +135,11 @@ const REST_GATE_PRIVATE_STATE: &str =
 const REST_GATE_QUOTE: &str =
     "Derive REST fallback has no sufficiently fresh quote for this instrument";
 
+/// Refusal reason when a write admitted on a healthy session reaches the
+/// enqueue boundary after execution has entered REST fallback whose recovery
+/// has not been released.
+const REST_GATE_FALLBACK_PENDING: &str = "Derive execution entered REST fallback while this write was queued and its recovery is not yet applied";
+
 /// Refusal reason when a reserved write's own record is gone by the time it
 /// reaches the enqueue boundary, so nothing would own its outcome.
 const REST_GATE_RESERVATION_LOST: &str =
@@ -686,9 +691,10 @@ impl DeriveExecutionClient {
             // 0.06, not be compared with it individually. The comparison runs
             // in both directions, so exposure the venue reports but the cache
             // lacks keeps the generation unapplied just as surely as cached
-            // exposure the venue does not report. Local state whose last event
-            // is newer than the snapshot is exempt, since a snapshot cannot
-            // contain what did not yet exist when it was taken.
+            // exposure the venue does not report. Equal aggregates settle an
+            // instrument whatever the timestamps say; an unequal one is never
+            // waived, and local state newer than the snapshot only makes the
+            // instrument indeterminate, which still denies.
             let mut cached_signed: AHashMap<InstrumentId, Decimal> = AHashMap::new();
             let mut locally_changed: AHashSet<InstrumentId> = AHashSet::new();
             for position in cache.positions_open_refs(
@@ -2174,15 +2180,14 @@ impl ExecutionClient for DeriveExecutionClient {
             // long, and a write that turned ambiguous meanwhile must halt this
             // one before it reaches the venue.
             //
-            // This is as close to the enqueue as the client's API allows. The
-            // send helper still awaits `refresh_matching_reservation` (a no-op
-            // unless signing crossed a window boundary) and the command-sender
-            // read lock before it enqueues, so a halt appearing inside that
-            // window is not caught. Reserving quota after signing would close
-            // it but would spend the signature's TTL on pacing, which
+            // The send helper still awaits `refresh_matching_reservation` and
+            // the command-sender read lock before enqueueing, so this check is
+            // not the last word: the `*_checked` helper runs `pre_send_check`
+            // after both of those, immediately before the enqueue. Quota is
+            // deliberately reserved before signing, not after — reserving
+            // after would spend the signature's TTL on pacing, which
             // `test_deeply_paced_submit_builds_signature_after_matching_quota_wait`
-            // exists to prevent. Closing it properly needs a pre-send check
-            // inside the client.
+            // exists to prevent.
             //
             // Only when the fallback feature is enabled. With it off there is
             // no reconciliation loop to ever resolve an unresolved record, so
@@ -3525,6 +3530,18 @@ impl RestExecutionState {
             .any(|(other, write)| *other != token && write.stage == WriteStage::Ambiguous)
         {
             return Err(REST_GATE_UNRESOLVED_WRITE);
+        }
+        drop(unresolved);
+        // Routing was decided before this command's asynchronous preparation,
+        // so it can arrive here having crossed a disconnect and a fresh
+        // authentication. Authentication alone is not enough: recovery
+        // deliberately keeps fallback active until the reconciliation is
+        // complete, fresh and applied, and a working order may have filled
+        // during the outage. Sending now would size new exposure from
+        // pre-outage state, so the current state is read here rather than
+        // trusted from the captured routing decision.
+        if self.active.load(Ordering::Acquire) {
+            return Err(REST_GATE_FALLBACK_PENDING);
         }
         Ok(())
     }
@@ -5823,6 +5840,55 @@ mod tests {
             "the refusal reason travels back out of band, not through the error",
         );
         parked.resolve();
+    }
+
+    #[rstest]
+    fn test_pre_send_check_refuses_when_fallback_became_active_while_queued() {
+        // The routing decision is taken before a command's asynchronous
+        // preparation, so a write admitted on a healthy session can reach the
+        // enqueue boundary after execution has entered fallback. Authentication
+        // being restored is not enough — recovery keeps fallback active until
+        // its reconciliation is complete, fresh and applied.
+        let state = Arc::new(RestExecutionState::default());
+        let queued = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-QUEUED-INTO-FALLBACK"),
+            None,
+            RestWriteKind::RiskIncreasingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("admitted while healthy");
+        let (before_send, refusal) = pre_send_check(&state, Some(queued.token()));
+
+        // Nothing is ambiguous; only the routing state changed.
+        assert!(!has_ambiguous_writes(&state));
+        state.active.store(true, Ordering::Release);
+
+        assert!(before_send().is_err(), "the queued write must be refused");
+        assert_eq!(refusal.lock().take(), Some(REST_GATE_FALLBACK_PENDING));
+        queued.resolve();
+    }
+
+    #[rstest]
+    fn test_pre_send_check_lets_a_reducing_write_through_active_fallback() {
+        // Entering fallback must not take away the de-risking lever either.
+        let state = Arc::new(RestExecutionState::default());
+        state.active.store(true, Ordering::Release);
+        let reducing = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-REDUCING-IN-FALLBACK"),
+            None,
+            RestWriteKind::ReducingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("reduce-only write admitted");
+        let (before_send, refusal) = pre_send_check(&state, Some(reducing.token()));
+
+        assert!(before_send().is_ok());
+        assert_eq!(refusal.lock().take(), None);
+        reducing.resolve();
     }
 
     #[rstest]

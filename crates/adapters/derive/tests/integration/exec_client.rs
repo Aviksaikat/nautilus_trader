@@ -3245,11 +3245,19 @@ async fn test_a_newer_sleeve_that_agrees_with_the_venue_still_admits() {
 
 #[rstest]
 #[tokio::test]
-async fn test_a_write_parked_on_rolled_window_quota_is_re_gated_before_enqueue() {
+async fn test_a_write_parked_on_quota_is_re_gated_after_the_wait() {
     // The venue allows one matching request per second. The second entry clears
     // the gate when it arrives, then has to wait for the next quota window
     // before it can be sent. The first write turns ambiguous during that wait,
-    // so the parked one must be refused at the boundary rather than enqueued.
+    // so the parked one must be refused rather than enqueued.
+    //
+    // Scope: this pins admission happening *after* the quota wait, and goes red
+    // when that check is removed. It does not isolate the client's own
+    // pre-enqueue hook, because the hook's ambiguity condition is identical to
+    // the admission gate's a few lines earlier — the hook's ordering is covered
+    // by `test_a_queued_websocket_entry_is_refused_when_fallback_opens_while_it_waits`,
+    // where the routing state diverges between the two, and by the
+    // `pre_send_check` unit tests.
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *ws_state.order_reply.lock().await = Some(json!({
@@ -3397,6 +3405,162 @@ async fn test_feature_off_ambiguous_websocket_write_does_not_block_the_next_entr
         "the second entry must reach the venue unchanged with the feature off",
     );
     drop(writes);
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_a_queued_websocket_entry_is_refused_when_fallback_opens_while_it_waits() {
+    // The command is admitted on a healthy session, parks in its asynchronous
+    // preparation, and the session then drops and re-authenticates. Execution
+    // is in fallback with its recovery unapplied, so the parked entry must be
+    // refused before it reaches the venue — nothing about it is ambiguous, so
+    // only a check of the *current* routing state can catch it.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    rest_state
+        .get_instrument_delay_ms
+        .store(4_000, Ordering::SeqCst);
+    let mut tc =
+        build_client_with_config(rest_state.clone(), ws_state.clone(), None, |mut config| {
+            config.rest_fallback_enabled = true;
+            config.private_state_poll_interval_secs = Some(1);
+            config.max_account_state_age_secs = Some(30);
+            config.max_quote_age_secs = Some(30);
+            config
+        })
+        .await;
+    tc.client.connect().await.expect("initial connect succeeds");
+
+    // Not pre-cached, so the command parks on the delayed instrument fetch.
+    let btc = InstrumentId::from("BTC-PERP.DERIVE");
+    let queued = build_limit_order(
+        btc,
+        ClientOrderId::from("STRAT-WS-QUEUED-INTO-FALLBACK"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(queued.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&queued))
+        .expect("queued submit accepted");
+    wait_until(
+        || {
+            let state = rest_state.clone();
+            async move { !state.get_instrument_calls.lock().await.is_empty() }
+        },
+        "queued command parked on instrument resolution",
+    )
+    .await;
+
+    // Lose and regain the session while it is parked: authentication comes
+    // back, but recovery keeps fallback active until its reports are applied.
+    ws_state.disconnect_now.store(true, Ordering::SeqCst);
+    wait_until(
+        || {
+            let ws = ws_state.clone();
+            let rest = rest_state.clone();
+            async move {
+                ws.login_frames.lock().await.len() >= 2
+                    && !rest.order_history_calls.lock().await.is_empty()
+            }
+        },
+        "re-authentication and REST reconciliation while the command is parked",
+    )
+    .await;
+
+    let reason = denied_or_rejected_reason(&mut tc.rx, &queued.client_order_id()).await;
+    assert!(
+        reason.contains("entered REST fallback while this write was queued"),
+        "the parked entry must be refused for the current routing state: {reason}",
+    );
+    assert!(
+        ws_state.submitted_orders.lock().await.is_empty(),
+        "nothing may reach the venue over the WebSocket",
+    );
+    assert!(
+        rest_state.submitted_orders.lock().await.is_empty(),
+        "and the refused command is not rerouted over REST either",
+    );
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_a_queued_reduce_only_entry_still_goes_out_when_fallback_opens() {
+    // Same crossing, but exposure-reducing: entering fallback must not take
+    // away the de-risking lever.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    rest_state
+        .get_instrument_delay_ms
+        .store(4_000, Ordering::SeqCst);
+    let mut tc =
+        build_client_with_config(rest_state.clone(), ws_state.clone(), None, |mut config| {
+            config.rest_fallback_enabled = true;
+            config.private_state_poll_interval_secs = Some(1);
+            config.max_account_state_age_secs = Some(30);
+            config.max_quote_age_secs = Some(30);
+            config
+        })
+        .await;
+    tc.client.connect().await.expect("initial connect succeeds");
+
+    let btc = InstrumentId::from("BTC-PERP.DERIVE");
+    let exit = build_reduce_only_limit_order(
+        btc,
+        ClientOrderId::from("STRAT-WS-QUEUED-REDUCING"),
+        OrderSide::Sell,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(exit.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&exit))
+        .expect("queued reduce-only submit accepted");
+    wait_until(
+        || {
+            let state = rest_state.clone();
+            async move { !state.get_instrument_calls.lock().await.is_empty() }
+        },
+        "queued reduce-only command parked on instrument resolution",
+    )
+    .await;
+
+    ws_state.disconnect_now.store(true, Ordering::SeqCst);
+    wait_until(
+        || {
+            let ws = ws_state.clone();
+            let rest = rest_state.clone();
+            async move {
+                ws.login_frames.lock().await.len() >= 2
+                    && !rest.order_history_calls.lock().await.is_empty()
+            }
+        },
+        "re-authentication while the reduce-only command is parked",
+    )
+    .await;
+
+    // It is written on whichever transport routing settles on, but written.
+    wait_until_async(
+        || {
+            let ws = ws_state.clone();
+            let rest = rest_state.clone();
+            async move {
+                !ws.submitted_orders.lock().await.is_empty()
+                    || !rest.submitted_orders.lock().await.is_empty()
+            }
+        },
+        Duration::from_secs(15),
+    )
+    .await;
     tc.client.disconnect().await.expect("disconnect succeeds");
 }
 
