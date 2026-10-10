@@ -644,7 +644,8 @@ Class/struct: `DeriveExecutionClientConfig`.
 | `transport_backend`                               | `Sockudo` | WebSocket transport when `transport-sockudo` is enabled.                                                                                                                          |
 | `rest_fallback_enabled`                           | `false`   | Temporary incident workaround; see [REST polling failover](#rest-polling-failover-temporary).                                                                                    |
 | `private_state_poll_interval_secs`                | `None`    | Interval in seconds between private-state reconciliations while REST fallback is active. Required (and must be positive) when the option above is enabled.                      |
-| `max_account_state_age_secs`                      | `None`    | Maximum age in seconds of the last successful private-state reconciliation for allowing risk-increasing orders. Required (and must be positive) when REST fallback is enabled.   |
+| `max_account_state_age_secs`                      | `None`    | Maximum age in seconds of the last successful **private-state** reconciliation (account/positions/orders) for allowing risk-increasing orders. Required (and must be positive) when REST fallback is enabled. |
+| `max_quote_age_secs`                              | `None`    | Maximum age in seconds of the **quote** used for market-order pricing and the risk-increasing entry/replace gate. Independent of `max_account_state_age_secs` and of the data client's `rest_market_data_max_quote_age_secs` — execution enforces its own bound rather than assuming data's is at least as strict. Required (and must be positive) when REST fallback is enabled. |
 
 The default transport falls back to `Tungstenite` when the build disables the
 `transport-sockudo` feature.
@@ -683,30 +684,39 @@ exec_config = DeriveExecutionClientConfig(
     rest_fallback_enabled=True,
     private_state_poll_interval_secs=30,
     max_account_state_age_secs=90,
+    max_quote_age_secs=60,
 )
 ```
 
 **Mandatory positive bounds.** Both halves fail construction if enabled without their interval and
 maximum-age fields set to a value greater than zero: `rest_market_data_poll_interval_ms` and
-`rest_market_data_max_quote_age_secs` for data, `private_state_poll_interval_secs` and
-`max_account_state_age_secs` for execution. None of the four has a built-in default once enabled,
-and this adapter does not ship a recommended production cadence as a default — see
-[Rate limiting](#rate-limiting) and choose polling intervals and maximum ages from the venue's
-documented per-IP and per-wallet limits, sized for however many instruments and accounts the
-deployment actually polls.
+`rest_market_data_max_quote_age_secs` for data; `private_state_poll_interval_secs`,
+`max_account_state_age_secs`, and `max_quote_age_secs` for execution. None of these has a built-in
+default once enabled, and this adapter does not ship a recommended production cadence as a
+default — see [Rate limiting](#rate-limiting) and choose polling intervals and maximum ages from
+the venue's documented per-IP and per-wallet limits, sized for however many instruments and
+accounts the deployment actually polls.
 
 **REST recovery behavior.** The data client polls `public/get_ticker` per instrument while a
 WebSocket ticker subscription is missing or its last update exceeds the configured maximum age;
 it reverts to the WebSocket quote as soon as a fresh, confirmed subscription update arrives. The
 execution client polls private state (subaccount, open orders, positions, recent fills) on the
 configured interval while the WebSocket session is unauthenticated or unavailable, and returns to
-WebSocket-only operation once the socket reconnects and reconciliation completes.
+WebSocket-only operation once the socket reconnects and reconciliation completes. Execution's own
+`max_account_state_age_secs` and `max_quote_age_secs` bounds are enforced independently of each
+other and of the data client's bound — a fresh quote does not excuse stale private state, and
+vice versa.
 
-**Unresolved-write halting.** A REST order write whose outcome is ambiguous (for example, a
-transport error or timeout where the venue's acceptance of the request cannot be confirmed) blocks
-new risk-increasing orders for the affected client until reconciliation observes a definitive
-report for that order. This is a deliberate fail-closed stance: an unresolved write is treated as
-"maybe live" until proven otherwise, not as rejected.
+**Unresolved-write halting.** A REST (or WebSocket) order write whose outcome is ambiguous (for
+example, a transport error or timeout where the venue's acceptance of the request cannot be
+confirmed) blocks new risk-increasing orders for the affected client. This is a deliberate
+fail-closed stance: an unresolved write is treated as "maybe live" until proven otherwise, never as
+rejected. The block is lifted **only** by a definitive, positive venue report naming that specific
+write (a mass status, order report, or fill that resolves it one way or the other) — never by a
+timeout or by the absence of the order from a private-state read, since an absent-looking read does
+not prove the write never reached the venue. If the venue never produces that definitive evidence,
+the block persists for the life of the process; restarting the client is the only other way to
+clear it.
 
 **Unsupported during execution REST fallback:**
 
@@ -715,6 +725,22 @@ report for that order. This is a deliberate fail-closed stance: an unresolved wr
 
 These are rejected explicitly rather than silently degraded; reduce-only submits and per-order
 `cancel_order` remain available so a position can still be de-risked during the outage.
+
+**Reduce-only submits bypass the freshness and quote gates by design.** A reduce-only order cannot
+increase exposure — Derive refuses a reduce-only order that would — so these submits are
+deliberately exempt from the private-state freshness gate, the quote-age gate, and unrelated
+account-wide ambiguity, keeping the de-risking lever available during exactly the outage this
+failover exists for. That asymmetry rests entirely on the venue enforcing `reduce_only`; the local
+position view may be stale while such an order is sent.
+
+**Polling cadence shares one rate budget with private-state reconciliation.** Market-data polling
+and execution's private-state polling both draw from the same per-wallet/IP non-matching allowance
+(see [Rate limiting](#rate-limiting)); this adapter cannot see the combined total across both
+clients, so no hard limit is enforced across them. The data client logs a one-time warning if its
+own polling alone (instrument count ÷ poll interval) would exceed half the documented non-matching
+TPS budget, as a conservative heads-up that leaves headroom for execution's share — but passing
+that check is not proof the combined cadence is safe; size both clients' intervals from the
+documented venue limits for the actual number of instruments and accounts polled.
 
 ### Python live node
 

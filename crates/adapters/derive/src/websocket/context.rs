@@ -22,6 +22,8 @@ use nautilus_core::{AtomicMap, AtomicSet, UnixNanos, time::AtomicTime};
 use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
 use parking_lot::Mutex;
 
+use super::client::SessionEpoch;
+
 pub(crate) struct WsMessageContext {
     pub(crate) clock: &'static AtomicTime,
     pub(crate) data_sender: EventSender<DataEvent>,
@@ -49,60 +51,18 @@ pub(crate) struct QuoteFeedState {
     pub(crate) last_ws_received: Option<UnixNanos>,
     pub(crate) ws_subscription_confirmed: bool,
     pub(crate) rest_polling: bool,
-    /// The transport connection epoch as of the most recent genuine WS
+    /// The transport/session identity as of the most recent genuine WS
     /// subscription confirmation or accepted quote. Fences
     /// `ws_subscription_confirmed` and WS freshness against a prior
-    /// session's state surviving a reconnect: `has_subscription` reflects a
-    /// retained desired-subscription map, not a current-epoch
-    /// acknowledgement, so a stale confirmation from before a reconnect
-    /// must not let a new-session replay ticker (or the REST poller) treat
-    /// the WS as current before this epoch is reached again.
-    pub(crate) ws_epoch: Option<u64>,
-}
-
-/// Read-only, cloneable view of the Derive data client's per-instrument
-/// quote freshness.
-///
-/// The execution client has no direct access to the data client's internal
-/// state and currently infers market-data health only from
-/// [`crate::data::DeriveDataClient::is_connected`], which can report `true`
-/// throughout a REST-failover outage even if no REST poll has ever actually
-/// produced a quote (`rest_failover_active` latches as soon as the initial
-/// WebSocket connect fails, independent of REST poll outcomes). This handle
-/// lets a caller check the venue-observed, per-instrument ground truth
-/// instead: obtain it from [`crate::data::DeriveDataClient::quote_health_handle`]
-/// and share it with whatever needs to gate on "has a quote actually been
-/// seen for this instrument, and how recently" (e.g. the execution client's
-/// "missing required quote disables new entries" check).
-// Not yet called outside this crate's data-client tests: it is staged for
-// the execution client (a separate, concurrently developed file) to consume
-// once wired up. Keep it rather than deleting it as dead code; removing it
-// would hand execution no path to the per-instrument quote evidence the
-// "missing required quote disables new entries" design requirement needs.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct DeriveQuoteHealthHandle {
-    quote_feed_state: Arc<Mutex<ahash::AHashMap<InstrumentId, QuoteFeedState>>>,
-}
-
-#[allow(dead_code)]
-impl DeriveQuoteHealthHandle {
-    pub(crate) fn new(
-        quote_feed_state: Arc<Mutex<ahash::AHashMap<InstrumentId, QuoteFeedState>>>,
-    ) -> Self {
-        Self { quote_feed_state }
-    }
-
-    /// Returns the local receipt time of the most recent successfully
-    /// published quote (WebSocket or REST) for `instrument_id`.
-    ///
-    /// `None` means no quote has ever been published for this instrument —
-    /// including while the data client itself reports connected, since that
-    /// readiness latch does not require a REST poll to have succeeded.
-    pub(crate) fn last_quote_event(&self, instrument_id: InstrumentId) -> Option<UnixNanos> {
-        self.quote_feed_state
-            .lock()
-            .get(&instrument_id)
-            .and_then(|state| state.last_published_event)
-    }
+    /// session's state surviving a reconnect *or* a transport rebuild:
+    /// `has_subscription` reflects a retained desired-subscription map, not
+    /// a current-session acknowledgement, so a stale confirmation from
+    /// before a reconnect must not let a new-session replay ticker (or the
+    /// REST poller) treat the WS as current before this identity is reached
+    /// again. Carries the full [`crate::websocket::client::SessionEpoch`]
+    /// (transport generation + per-transport epoch), not the bare epoch:
+    /// a rebuilt transport's own epoch restarts at the same values an
+    /// earlier, now-dead transport used, so the epoch alone cannot
+    /// distinguish "this session" from "a session that no longer exists".
+    pub(crate) ws_epoch: Option<SessionEpoch>,
 }

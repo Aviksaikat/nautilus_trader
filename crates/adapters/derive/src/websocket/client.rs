@@ -152,9 +152,16 @@ pub(super) const UNAUTHENTICATED_CONNECTION_EPOCH: u64 = u64::MAX;
 /// confirmation recorded under a torn-down transport's epoch zero would
 /// wrongly match a freshly rebuilt transport that also starts at epoch zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SessionEpoch {
+pub(crate) struct SessionEpoch {
     generation: u64,
     epoch: u64,
+}
+
+#[cfg(test)]
+impl SessionEpoch {
+    pub(crate) fn for_test(generation: u64, epoch: u64) -> Self {
+        Self { generation, epoch }
+    }
 }
 
 /// WebSocket client for the Derive JSON-RPC stream.
@@ -1012,7 +1019,14 @@ impl DeriveWebSocketSubscriptionHandle {
         self.transport_generation.load(Ordering::Acquire)
     }
 
-    fn current_session_epoch(&self) -> SessionEpoch {
+    /// Returns the current transport/session identity: the generation of
+    /// the transport currently installed, paired with that transport's own
+    /// low-level connection epoch. Callers that cache their own "is this
+    /// confirmation/evidence still current" state (e.g. the data client's
+    /// per-instrument quote feed state) must key on this full identity, not
+    /// on [`Self::connection_epoch`] alone — a rebuilt transport's epoch
+    /// restarts at the same values an earlier, now-dead transport used.
+    pub(crate) fn current_session_epoch(&self) -> SessionEpoch {
         SessionEpoch {
             generation: self.transport_generation(),
             epoch: self.connection_epoch(),
@@ -1147,8 +1161,16 @@ impl DeriveWebSocketSubscriptionHandle {
         let (confirmed, failure) =
             subscription_outcome(&params.channels, &result, SUBSCRIPTION_ACCEPTED_STATUSES);
 
+        // Record the current transport/session identity for each
+        // ACK-confirmed channel, exactly as `send_subscribe` does for a
+        // single-channel subscribe. Without this, a rebuilt-transport
+        // replay (bulk) would acknowledge the channel at the venue but
+        // leave `confirmed_channels` empty, so `channel_confirmed_for_current_epoch`
+        // could never become true for it again.
+        let session_epoch = self.current_session_epoch();
         for channel in confirmed {
-            self.subscriptions.insert(channel, ());
+            self.subscriptions.insert(channel.clone(), ());
+            self.confirmed_channels.insert(channel, session_epoch);
         }
         failure.map_or(Ok(()), Err)
     }
@@ -2151,6 +2173,28 @@ mod tests {
 
     use super::*;
     use crate::common::rate_limit::RateBucket;
+
+    #[rstest]
+    fn test_session_epoch_distinguishes_rebuilt_transport_from_bare_epoch_collision() {
+        // F6: a rebuilt transport's own epoch restarts at the same values
+        // an earlier, now-dead transport used (both start fresh at 0), so
+        // the bare epoch alone cannot tell "this session" apart from "a
+        // session that no longer exists". `SessionEpoch` must therefore
+        // compare unequal whenever the generation differs, even when the
+        // epoch component happens to collide.
+        let dead_transport = SessionEpoch::for_test(1, 0);
+        let rebuilt_transport = SessionEpoch::for_test(2, 0);
+
+        assert_ne!(
+            dead_transport, rebuilt_transport,
+            "two transports with colliding epochs but different generations must not compare equal",
+        );
+        assert_eq!(
+            dead_transport,
+            SessionEpoch::for_test(1, 0),
+            "the same transport generation and epoch must still compare equal",
+        );
+    }
 
     #[rstest]
     fn test_public_client_defaults_to_environment_url() {

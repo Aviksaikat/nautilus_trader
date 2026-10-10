@@ -1359,6 +1359,129 @@ async fn test_initial_retry_task_restores_quote_subscription_after_terminal_stre
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_rest_stays_active_while_rebuilt_transport_replay_is_pending() {
+    // F6+F9: the retry owner's full transport rebuild runs `connect()`
+    // then the bulk replay `subscribe_channels(...)` sequentially within
+    // its own task, before it ever reads another message from the new
+    // transport. While that replay's ack is outstanding (gated here, as
+    // it would be while truly in flight), REST must keep covering the
+    // instrument: nothing may treat the rebuilt transport as confirmed
+    // before its own ACK actually lands. The companion unit tests
+    // `test_session_epoch_distinguishes_rebuilt_transport_from_bare_epoch_collision`
+    // and `test_invalidate_quote_feed_state_resets_confirmation_at_rebuild_boundary`
+    // cover F6's mechanism directly; `test_initial_retry_task_restores_quote_subscription_after_terminal_stream_failure`
+    // covers F9's positive case (a genuinely ACKed replay recovers WS).
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let channel = "ticker_slim.ETH-PERP.1000";
+    ws_state.upgrade_failures.store(1, Ordering::SeqCst);
+
+    let initial_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    let mut initial_notification = subscription_notification(channel).unwrap();
+    initial_notification["params"]["data"]["instrument_ticker"]["t"] = json!(initial_ms);
+    initial_notification["params"]["data"]["timestamp"] = json!(initial_ms);
+    ws_state
+        .subscription_notifications
+        .lock()
+        .await
+        .insert(channel.to_string(), vec![initial_notification]);
+
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.rest_market_data_failover_enabled = true;
+    cfg.rest_market_data_poll_interval_ms = Some(20);
+    cfg.rest_market_data_max_quote_age_secs = Some(5);
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+
+    // Initial upgrade fails once; the retry task redials and succeeds.
+    client.connect().await.unwrap();
+    wait_until_async(
+        || {
+            let ws_state = ws_state.clone();
+            async move { ws_state.connection_count.load(Ordering::SeqCst) >= 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    client
+        .subscribe_quotes(subscribe_quotes(instrument_id, None))
+        .unwrap();
+    wait_for_subscribe(&ws_state, channel).await;
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(quote.ts_event.as_u64(), initial_ms as u64 * 1_000_000),
+        other => panic!("expected initial WebSocket quote, was {other:?}"),
+    }
+
+    // Arm every remaining subscribe response up front: 3 rejections
+    // (exhausting MAX_SESSION_RECOVERY_ATTEMPTS deterministically, no
+    // manual reset needed) plus the rebuilt transport's own replay,
+    // whose reply stays gated -- simulating that replay's ack still
+    // being in flight.
+    ws_state.subscribe_failures.store(3, Ordering::SeqCst);
+    ws_state
+        .deferred_subscribe_responses
+        .store(4, Ordering::SeqCst);
+    ws_state.subscribe_response_gate.add_permits(3);
+
+    let attempts_before_terminal_failure = ws_state.upgrade_attempts.load(Ordering::SeqCst);
+    ws_state.force_disconnect().await;
+
+    wait_until_async(
+        || {
+            let ws_state = ws_state.clone();
+            async move {
+                ws_state.upgrade_attempts.load(Ordering::SeqCst)
+                    >= attempts_before_terminal_failure + 2
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        ws_state.upgrade_attempts.load(Ordering::SeqCst) >= attempts_before_terminal_failure + 2,
+        "the retry owner must rebuild the transport after a terminal recovery failure",
+    );
+
+    // 1 initial + 3 rejected recovery attempts + 1 rebuilt-transport
+    // replay.
+    wait_for_subscribe_count(&ws_state, channel, 5).await;
+
+    let fresh_rest_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    *rest_state.ticker_response.lock().await = json!({
+        "instrument_name": "ETH-PERP",
+        "best_ask_amount": "1.2",
+        "best_ask_price": "3501.0",
+        "best_bid_amount": "0.8",
+        "best_bid_price": "3499.5",
+        "index_price": "3500.0",
+        "mark_price": "3500.5",
+        "max_price": "5000",
+        "min_price": "100",
+        "timestamp": fresh_rest_ms,
+    });
+
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(
+            quote.bid_price,
+            Price::from("3499.50"),
+            "REST polling must not be suppressed while the rebuilt transport's \
+             replay ack is still outstanding",
+        ),
+        other => panic!("expected a REST quote before the rebuilt transport's ack, was {other:?}"),
+    }
+
+    ws_state.subscribe_response_gate.add_permits(1);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_rest_polling_resumes_immediately_after_transport_disconnect_despite_fresh_quote() {
     // REST polling must react to the transport actually being down, not
     // only to quote staleness: `is_connected` is cleared on a recovery

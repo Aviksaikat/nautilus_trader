@@ -123,6 +123,8 @@ class DeriveExecutionClientConfig:
     @property
     def max_account_state_age_secs(self) -> int | None: ...
     @property
+    def max_quote_age_secs(self) -> int | None: ...
+    @property
     def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
@@ -151,6 +153,7 @@ class DeriveExecutionClientConfig:
         rest_fallback_enabled: bool | None = None,
         private_state_poll_interval_secs: int | None = None,
         max_account_state_age_secs: int | None = None,
+        max_quote_age_secs: int | None = None,
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...

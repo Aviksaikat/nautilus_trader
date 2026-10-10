@@ -127,6 +127,7 @@ impl DeriveExecutionClientConfig {
         rest_fallback_enabled = None,
         private_state_poll_interval_secs = None,
         max_account_state_age_secs = None,
+        max_quote_age_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -155,6 +156,7 @@ impl DeriveExecutionClientConfig {
         rest_fallback_enabled: Option<bool>,
         private_state_poll_interval_secs: Option<u64>,
         max_account_state_age_secs: Option<u64>,
+        max_quote_age_secs: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -185,6 +187,7 @@ impl DeriveExecutionClientConfig {
             rest_fallback_enabled: rest_fallback_enabled.unwrap_or(defaults.rest_fallback_enabled),
             private_state_poll_interval_secs,
             max_account_state_age_secs,
+            max_quote_age_secs,
         }
     }
 

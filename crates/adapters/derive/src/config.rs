@@ -15,6 +15,9 @@
 
 //! Configuration structures for the Derive adapter.
 
+use std::time::Duration;
+
+use anyhow::Context;
 use nautilus_core::string::secret::SecretString;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
@@ -120,6 +123,36 @@ impl DeriveDataClientConfig {
             .clone()
             .unwrap_or_else(|| urls::ws_url(self.environment).to_string())
     }
+
+    /// Validates data configuration invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when REST market-data failover is enabled without a
+    /// positive polling interval and maximum quote age.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.rest_market_data_failover_enabled {
+            self.rest_market_data_poll_interval_ms
+                .filter(|interval| *interval > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "REST market-data failover requires a non-zero polling interval"
+                    )
+                })?;
+
+            let max_quote_age_secs = self
+                .rest_market_data_max_quote_age_secs
+                .filter(|age| *age > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "REST market-data failover requires a non-zero maximum quote age"
+                    )
+                })?;
+            u64::try_from(Duration::from_secs(max_quote_age_secs).as_nanos())
+                .context("maximum REST quote age exceeds the supported duration")?;
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for the Derive execution client.
@@ -221,6 +254,12 @@ pub struct DeriveExecutionClientConfig {
     /// reconciliation for allowing risk-increasing orders. Required when
     /// `rest_fallback_enabled` is true.
     pub max_account_state_age_secs: Option<u64>,
+    /// Maximum age in seconds of the quote used for market-order pricing and
+    /// the risk-increasing entry/replace gate while REST fallback is active.
+    /// Independent of the data client's `rest_market_data_max_quote_age_secs`
+    /// — execution must honor its own bound rather than assume data's is at
+    /// least as strict. Required when `rest_fallback_enabled` is true.
+    pub max_quote_age_secs: Option<u64>,
 }
 
 #[cfg(feature = "python")]
@@ -247,6 +286,7 @@ nautilus_core::impl_pyo3_config_getters!(DeriveExecutionClientConfig {
     rest_fallback_enabled: bool,
     private_state_poll_interval_secs: Option<u64>,
     max_account_state_age_secs: Option<u64>,
+    max_quote_age_secs: Option<u64>,
     transport_backend: TransportBackend,
 });
 
@@ -313,6 +353,13 @@ impl DeriveExecutionClientConfig {
             if max_age == 0 {
                 anyhow::bail!("max_account_state_age_secs must be greater than zero");
             }
+
+            let Some(max_quote_age) = self.max_quote_age_secs else {
+                anyhow::bail!("max_quote_age_secs is required when REST fallback is enabled");
+            };
+            if max_quote_age == 0 {
+                anyhow::bail!("max_quote_age_secs must be greater than zero");
+            }
         }
         Ok(())
     }
@@ -356,6 +403,46 @@ mod tests {
     }
 
     #[rstest]
+    fn test_data_config_validate_accepts_disabled_default() {
+        assert!(DeriveDataClientConfig::default().validate().is_ok());
+    }
+
+    #[rstest]
+    fn test_data_config_validate_requires_bounds_when_failover_enabled() {
+        let base = DeriveDataClientConfig {
+            rest_market_data_failover_enabled: true,
+            rest_market_data_poll_interval_ms: Some(20_000),
+            rest_market_data_max_quote_age_secs: Some(60),
+            ..DeriveDataClientConfig::default()
+        };
+        assert!(base.validate().is_ok());
+
+        let missing_interval = DeriveDataClientConfig {
+            rest_market_data_poll_interval_ms: None,
+            ..base.clone()
+        };
+        assert!(
+            missing_interval
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-zero polling interval"),
+        );
+
+        let zero_age = DeriveDataClientConfig {
+            rest_market_data_max_quote_age_secs: Some(0),
+            ..base
+        };
+        assert!(
+            zero_age
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-zero maximum quote age"),
+        );
+    }
+
+    #[rstest]
     fn test_data_config_urls_mainnet() {
         let config = DeriveDataClientConfig::default();
         assert!(config.rest_url().contains("api.lyra.finance"));
@@ -387,7 +474,48 @@ mod tests {
         assert!(!config.rest_fallback_enabled);
         assert!(config.private_state_poll_interval_secs.is_none());
         assert!(config.max_account_state_age_secs.is_none());
+        assert!(config.max_quote_age_secs.is_none());
         assert!(!config.has_credentials());
+    }
+
+    #[rstest]
+    fn test_exec_config_validate_requires_max_quote_age_secs_when_rest_fallback_enabled() {
+        let base = DeriveExecutionClientConfig {
+            max_fee_per_contract: Some(Decimal::ONE),
+            rest_fallback_enabled: true,
+            private_state_poll_interval_secs: Some(30),
+            max_account_state_age_secs: Some(90),
+            ..DeriveExecutionClientConfig::default()
+        };
+
+        let missing = DeriveExecutionClientConfig {
+            max_quote_age_secs: None,
+            ..base.clone()
+        };
+        assert!(
+            missing
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max_quote_age_secs is required"),
+        );
+
+        let zero = DeriveExecutionClientConfig {
+            max_quote_age_secs: Some(0),
+            ..base.clone()
+        };
+        assert!(
+            zero.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max_quote_age_secs must be greater than zero"),
+        );
+
+        let valid = DeriveExecutionClientConfig {
+            max_quote_age_secs: Some(60),
+            ..base
+        };
+        assert!(valid.validate().is_ok());
     }
 
     #[rstest]

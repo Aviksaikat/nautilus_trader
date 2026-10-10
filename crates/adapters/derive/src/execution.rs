@@ -139,10 +139,10 @@ const REST_GATE_QUOTE: &str =
 const REST_GATE_UNRESOLVED_ORDER: &str =
     "Derive REST fallback cannot act on this order while its write outcome is unresolved";
 
-/// Consecutive settled, complete reconciliations that must each find no trace
-/// of an ambiguous write before its absence is accepted as evidence that the
-/// write never reached the venue.
-const REST_ABSENCE_OBSERVATIONS_REQUIRED: u32 = 2;
+/// Refusal reason when any write's venue outcome is still unknown. Applies on
+/// either transport: a possibly-live order blocks risk-increasing commands
+/// whether it was sent over REST or the WebSocket.
+const REST_GATE_UNRESOLVED_WRITE: &str = "Derive execution has a write with an unknown venue outcome; risk-increasing orders are halted until reconciliation resolves it";
 
 /// Whether every row a reconciliation needed was converted.
 ///
@@ -412,7 +412,6 @@ impl DeriveExecutionClient {
             dispatch_state: Arc::clone(&self.dispatch_state),
             rest_execution_state: Arc::clone(&self.rest_execution_state),
             is_connected: Arc::clone(&self.is_connected),
-            private_state_poll_interval_secs: self.config.private_state_poll_interval_secs,
             max_account_state_age_secs: self.config.max_account_state_age_secs,
         }
     }
@@ -449,7 +448,15 @@ impl DeriveExecutionClient {
                             );
                             rest_execution_state.websocket_ready.store(false, Ordering::Release);
                         }
-                        if rest_execution_state.active.load(Ordering::Acquire)
+                        // Reconcile while routing through REST, and also
+                        // whenever any write's outcome is unknown: that is the
+                        // only way positive evidence about it can arrive, and a
+                        // JSON-RPC ambiguity does not require the socket to
+                        // drop, so it can happen with routing still on the
+                        // WebSocket.
+                        let needs_reconciliation = rest_execution_state.active.load(Ordering::Acquire)
+                            || has_unresolved_writes(&rest_execution_state);
+                        if needs_reconciliation
                             && let Err(e) = context.reconcile_private_state().await
                         {
                             rest_execution_state
@@ -458,12 +465,16 @@ impl DeriveExecutionClient {
                             log::warn!("Derive REST-mode private reconciliation failed: {e:?}");
                         } else if rest_execution_state.active.load(Ordering::Acquire)
                             && rest_execution_state.websocket_ready.load(Ordering::Acquire)
-                            && rest_execution_state.unresolved_orders.lock().is_empty()
+                            && context.rest_mode_may_exit()
                         {
+                            // Same predicate as `recover_after_reconnect`: an
+                            // incomplete, stale or unapplied generation may not
+                            // hand routing back to the WebSocket, where these
+                            // gates would otherwise be skipped.
                             set_rest_fallback_active(
                                 &rest_execution_state,
                                 false,
-                                "websocket_ready_and_all_writes_resolved",
+                                "reconciliation_complete_fresh_and_applied",
                                 context.clock.get_time_ns().as_u64(),
                             );
                         }
@@ -480,56 +491,242 @@ impl DeriveExecutionClient {
                 || !self.ws_exec.is_authenticated())
     }
 
-    /// Synchronous pre-check for a risk-increasing fallback write, so an order
-    /// that cannot be admitted is denied before `OrderSubmitted` is emitted.
-    /// [`reserve_rest_write`] re-applies the same predicate atomically with the
+    /// Synchronous pre-check for a risk-increasing write, so an order that
+    /// cannot be admitted is denied before `OrderSubmitted` is emitted.
+    /// [`reserve_write`] re-applies the same predicate atomically with the
     /// write itself.
-    fn rest_entry_gate_open(&self, quote_ts_event: Option<UnixNanos>) -> bool {
+    ///
+    /// Returns the refusal reason, or `None` when the write may proceed. The
+    /// unresolved-write term applies on either transport, because a
+    /// possibly-live order is just as dangerous when the socket that sent it is
+    /// still healthy.
+    fn risk_increasing_write_blocked(
+        &self,
+        quote_ts_event: Option<UnixNanos>,
+    ) -> Option<&'static str> {
         let now_ns = self.clock.get_time_ns().as_u64();
-        let max_age_secs = self.config.max_account_state_age_secs;
+        // Always evaluated, and before any early return, because it is what
+        // latches the applied generation while the cache is reachable — both
+        // for the reservation that re-checks inside the spawned task and for
+        // the routing decision that hands order entry back to the WebSocket.
+        let applied = self.refresh_applied_generation();
 
-        self.reconciliation_reports_applied()
-            && private_state_is_fresh(&self.rest_execution_state, now_ns, max_age_secs)
-            && quote_is_fresh(quote_ts_event, now_ns, max_age_secs)
-            && self
-                .rest_execution_state
-                .unresolved_orders
-                .lock()
-                .is_empty()
+        if has_unresolved_writes(&self.rest_execution_state) {
+            return Some(REST_GATE_UNRESOLVED_WRITE);
+        }
+        if !applied
+            || !private_state_is_fresh(
+                &self.rest_execution_state,
+                now_ns,
+                self.config.max_account_state_age_secs,
+            )
+        {
+            return Some(REST_GATE_PRIVATE_STATE);
+        }
+        if !quote_is_fresh(quote_ts_event, now_ns, self.config.max_quote_age_secs) {
+            return Some(REST_GATE_QUOTE);
+        }
+        None
     }
 
-    /// Returns whether the engine has applied the last complete
-    /// reconciliation's order reports: no order the venue reported closed is
-    /// still open in the cache.
+    /// Refreshes the applied-generation latch and re-evaluates order routing.
+    ///
+    /// Only the command thread can reach the cache, so every command refreshes
+    /// the latch even when its own admission does not depend on it; otherwise a
+    /// quiet period with no risk-increasing command would leave the generation
+    /// unlatched and strand routing in REST mode after the WebSocket had
+    /// recovered. Having just learned that the engine applied a complete, fresh
+    /// generation, this is also the earliest point at which routing may return
+    /// to the WebSocket, so the decision is taken here rather than waiting for
+    /// the next poll tick. An unresolved write deliberately does not keep
+    /// routing in REST mode — it halts risk-increasing commands on either
+    /// transport instead.
+    fn note_reconciliation_application(&self) {
+        if !self.config.rest_fallback_enabled {
+            return;
+        }
+        let applied = self.refresh_applied_generation();
+        let state = &self.rest_execution_state;
+        let now_ns = self.clock.get_time_ns().as_u64();
+        if applied
+            && state.active.load(Ordering::Acquire)
+            && state.websocket_ready.load(Ordering::Acquire)
+            && self.ws_exec.is_authenticated()
+            && private_state_is_fresh(state, now_ns, self.config.max_account_state_age_secs)
+        {
+            set_rest_fallback_active(
+                state,
+                false,
+                "reconciliation_complete_fresh_and_applied",
+                now_ns,
+            );
+        }
+    }
+
+    /// The configured staleness bounds for an admission decision.
+    fn freshness_bounds(&self) -> FreshnessBounds {
+        FreshnessBounds {
+            private_state_secs: self.config.max_account_state_age_secs,
+            quote_secs: self.config.max_quote_age_secs,
+        }
+    }
+
+    /// Whether an unresolved write currently halts risk-increasing commands,
+    /// regardless of which transport they would be routed over.
+    fn unresolved_write_halt(&self) -> Option<&'static str> {
+        (self.config.rest_fallback_enabled && has_unresolved_writes(&self.rest_execution_state))
+            .then_some(REST_GATE_UNRESOLVED_WRITE)
+    }
+
+    /// Latches and returns whether the engine has applied the last complete
+    /// reconciliation's reports, by checking that the cache now agrees with
+    /// what that generation reported.
+    ///
+    /// Agreement is checked in both directions and on the fields an entry
+    /// decision depends on. For every reported order the engine tracks, the
+    /// cached order must carry the reported venue order id and agree on
+    /// closed-ness, quantity and cumulative filled quantity, so a queued
+    /// replacement or an unapplied partial fill is never mistaken for applied
+    /// state. For every reported open position the cache must hold the same
+    /// side and quantity, and the cache must not hold an open order or position
+    /// that this generation's snapshot should have contained but did not — so
+    /// an empty report set proves application only when the cache is also free
+    /// of contrary state, never vacuously. Local state whose last event is
+    /// newer than the snapshot is exempt, because a snapshot cannot contain
+    /// what did not yet exist when it was taken.
     ///
     /// The cache is not `Send`, so this runs on the command thread and latches
-    /// the result for the reservation that follows inside the spawned task. A
-    /// reconciliation that is never applied goes stale on its own, so this can
+    /// per generation for the reservation that follows inside the spawned task.
+    /// A generation that is never applied goes stale on its own, so this can
     /// delay the gate opening but never hold it open.
-    fn reconciliation_reports_applied(&self) -> bool {
+    fn refresh_applied_generation(&self) -> bool {
+        let reported = self.rest_execution_state.reported_state.lock();
+        if reported.generation == 0 {
+            // No complete reconciliation has been recorded, so there is nothing
+            // that could have been applied.
+            return false;
+        }
         if self
             .rest_execution_state
-            .reports_applied
+            .applied_generation
             .load(Ordering::Acquire)
+            == reported.generation
         {
             return true;
         }
-        let reported = self.rest_execution_state.reported_order_closed.lock();
+
         let cache = self.core.cache();
-        let applied = reported.iter().all(|(client_order_id, venue_closed)| {
-            !*venue_closed
-                || cache
-                    .order(client_order_id)
-                    .is_none_or(|order| order.is_closed())
-        });
-        drop(cache);
-        drop(reported);
-        if applied {
-            self.rest_execution_state
-                .reports_applied
-                .store(true, Ordering::Release);
+        let mut disagreement: Option<String> = None;
+
+        for (client_order_id, expected) in &reported.orders {
+            let Some(order) = cache.order(client_order_id) else {
+                // Not tracked locally (an order placed outside this client), so
+                // there is no local state for it to disagree with.
+                continue;
+            };
+            if order.venue_order_id() != Some(expected.venue_order_id) {
+                disagreement = Some(format!(
+                    "{client_order_id} venue_order_id cached={:?} reported={}",
+                    order.venue_order_id(),
+                    expected.venue_order_id,
+                ));
+                break;
+            }
+            if order.is_closed() != expected.closed {
+                disagreement = Some(format!(
+                    "{client_order_id} closed cached={} reported={}",
+                    order.is_closed(),
+                    expected.closed,
+                ));
+                break;
+            }
+            if order.quantity().as_decimal() != expected.quantity {
+                disagreement = Some(format!(
+                    "{client_order_id} quantity cached={} reported={}",
+                    order.quantity(),
+                    expected.quantity,
+                ));
+                break;
+            }
+            if order.filled_qty().as_decimal() != expected.filled_qty {
+                disagreement = Some(format!(
+                    "{client_order_id} filled_qty cached={} reported={}",
+                    order.filled_qty(),
+                    expected.filled_qty,
+                ));
+                break;
+            }
         }
-        applied
+
+        if disagreement.is_none() {
+            for position in cache.positions_open_refs(
+                Some(&self.core.venue),
+                None,
+                None,
+                Some(&self.core.account_id),
+                None,
+            ) {
+                match reported.positions.get(&position.instrument_id) {
+                    Some((side, quantity))
+                        if *side == position.side
+                            && *quantity == position.quantity.as_decimal() => {}
+                    Some((side, quantity)) => {
+                        disagreement = Some(format!(
+                            "{} position cached={:?} {} reported={side:?} {quantity}",
+                            position.instrument_id, position.side, position.quantity,
+                        ));
+                        break;
+                    }
+                    None if position.ts_last <= reported.observed_at => {
+                        disagreement = Some(format!(
+                            "{} position cached={:?} {} but reported flat",
+                            position.instrument_id, position.side, position.quantity,
+                        ));
+                        break;
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        if disagreement.is_none() {
+            for order in cache.orders_open_refs(
+                Some(&self.core.venue),
+                None,
+                None,
+                Some(&self.core.account_id),
+                None,
+            ) {
+                let client_order_id = order.client_order_id();
+                if cache.client_id(&client_order_id) != Some(&self.core.client_id) {
+                    continue;
+                }
+                if order.ts_last() <= reported.observed_at
+                    && !reported.orders.contains_key(&client_order_id)
+                {
+                    disagreement = Some(format!(
+                        "{client_order_id} is open in the cache but absent from the reconciliation"
+                    ));
+                    break;
+                }
+            }
+        }
+
+        drop(cache);
+        let generation = reported.generation;
+        drop(reported);
+
+        if let Some(disagreement) = disagreement {
+            log::debug!(
+                "Derive reconciliation generation {generation} is not applied yet: {disagreement}"
+            );
+            return false;
+        }
+
+        self.rest_execution_state
+            .applied_generation
+            .store(generation, Ordering::Release);
+        true
     }
 
     /// Event time of the newest cached quote for `instrument_id`, captured on
@@ -634,7 +831,15 @@ impl DeriveExecutionClient {
         )
     }
 
-    fn start_initial_ws_retry_loop(&self, channels: Vec<DeriveWsChannel>) -> anyhow::Result<()> {
+    /// Starts the session's single WebSocket supervisor.
+    ///
+    /// One task owns redialling for the whole session, on both startup routes.
+    /// A healthy start parks it immediately; it wakes only once the socket's own
+    /// recovery has been exhausted (`ws_recovery_exhausted`), so it never races
+    /// the transport's internal reconnect. Without it on the healthy route, a
+    /// later terminal `SessionRecoveryFailed` would leave the client in REST
+    /// mode for the rest of the process while still reporting itself connected.
+    fn start_ws_supervisor(&self, channels: Vec<DeriveWsChannel>) -> anyhow::Result<()> {
         let session_spawner = self
             .session_tasks
             .spawner()
@@ -652,6 +857,24 @@ impl DeriveExecutionClient {
         self.session_tasks.spawn(async move {
             let mut retry_delay = RECONNECT_BASE_BACKOFF;
             loop {
+                // Park until the session is known to be unusable: either the
+                // transport's own recovery gave up (`SessionRecoveryFailed`),
+                // or the reconciliation loop observed an unauthenticated
+                // socket. A healthy startup therefore does nothing here until
+                // the session actually fails.
+                while !{
+                    let state = &context.rest_execution_state;
+                    state.ws_recovery_exhausted.load(Ordering::Acquire)
+                        || (state.active.load(Ordering::Acquire)
+                            && !state.websocket_ready.load(Ordering::Acquire))
+                } {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return,
+                        () = tokio::time::sleep(RECONNECT_BASE_BACKOFF) => {}
+                    }
+                }
+
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break,
@@ -710,42 +933,31 @@ impl DeriveExecutionClient {
                     .websocket_ready
                     .store(true, Ordering::Release);
                 if let Err(e) = context.recover_after_reconnect().await {
-                    log::warn!("Derive startup recovery after WebSocket retry failed: {e:?}");
-                    // Keep dialling: stopping here would leave the client in
-                    // permanent REST mode while presenting itself as connected.
-                    let _ = ws_client.lock().await.disconnect().await;
+                    // The transport itself is healthy — only the admission gate
+                    // is unsatisfied (an incomplete, stale or not-yet-applied
+                    // reconciliation). Tearing the socket down again would
+                    // churn the venue connection over a condition that the
+                    // reconciliation loop resolves on its own, so park instead
+                    // and let it hand routing back when the generation is good.
+                    log::warn!(
+                        "Derive recovery after WebSocket redial is not complete yet: {e:?}; holding REST routing"
+                    );
+                    retry_delay = RECONNECT_BASE_BACKOFF;
                     context
                         .rest_execution_state
-                        .websocket_ready
+                        .ws_recovery_exhausted
                         .store(false, Ordering::Release);
-                    retry_delay = retry_delay
-                        .mul_f64(RECONNECT_BACKOFF_FACTOR)
-                        .min(RECONNECT_MAX_BACKOFF);
                     continue;
                 }
 
-                // This task owns redialling for the whole session. Park until
-                // the dispatcher reports an unrecoverable session failure
-                // (`websocket_ready` cleared while fallback is active), then
-                // dial again rather than exiting and stranding the client in
-                // REST mode.
+                // The session is healthy again; hand recovery back to the
+                // transport and park until it exhausts itself once more.
                 retry_delay = RECONNECT_BASE_BACKOFF;
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => return,
-                        () = tokio::time::sleep(RECONNECT_BASE_BACKOFF) => {}
-                    }
-                    let state = &context.rest_execution_state;
-                    if state.active.load(Ordering::Acquire)
-                        && !state.websocket_ready.load(Ordering::Acquire)
-                    {
-                        log::warn!(
-                            "Derive execution WebSocket session failed after recovery; redialling"
-                        );
-                        break;
-                    }
-                }
+                context
+                    .rest_execution_state
+                    .ws_recovery_exhausted
+                    .store(false, Ordering::Release);
+                log::info!("Derive execution WebSocket session redialled and reconciled");
             }
         })?;
         Ok(())
@@ -811,6 +1023,12 @@ fn spawn_ws_dispatch(
                                 .rest_execution_state
                                 .websocket_ready
                                 .store(false, Ordering::Release);
+                            // The transport has given up, so the supervisor now
+                            // owns the next dial.
+                            reconciliation
+                                .rest_execution_state
+                                .ws_recovery_exhausted
+                                .store(true, Ordering::Release);
                             if !rest_fallback_enabled {
                                 is_connected.store(false, Ordering::Release);
                             }
@@ -1035,10 +1253,13 @@ impl ExecutionClient for DeriveExecutionClient {
                 self.teardown_partial_connect().await?;
                 return Err(e.context("failed waiting for Derive REST account registration"));
             }
+            self.rest_execution_state
+                .ws_recovery_exhausted
+                .store(true, Ordering::Release);
             self.start_rest_reconciliation_loop()
                 .context("failed to start Derive REST reconciliation task")?;
-            self.start_initial_ws_retry_loop(channels)
-                .context("failed to start Derive WebSocket startup retry task")?;
+            self.start_ws_supervisor(channels)
+                .context("failed to start Derive WebSocket supervisor task")?;
 
             self.core.set_connected();
             self.is_connected.store(true, Ordering::Release);
@@ -1067,6 +1288,11 @@ impl ExecutionClient for DeriveExecutionClient {
 
         self.start_rest_reconciliation_loop()
             .context("failed to start Derive REST reconciliation task")?;
+        self.rest_execution_state
+            .ws_recovery_exhausted
+            .store(false, Ordering::Release);
+        self.start_ws_supervisor(channels)
+            .context("failed to start Derive WebSocket supervisor task")?;
 
         // Fail-fast if the initial account snapshot cannot load: without it,
         // `await_account_registered` would block the full timeout window and
@@ -1097,15 +1323,13 @@ impl ExecutionClient for DeriveExecutionClient {
 
         self.core.set_connected();
         self.is_connected.store(true, Ordering::Release);
+        // Routing, not admission: an unresolved write deliberately does not
+        // force REST routing, because the unresolved-write gate halts
+        // risk-increasing commands on either transport.
         let recovery_pending = self
             .rest_execution_state
             .reconciliation_failed
-            .load(Ordering::Acquire)
-            || !self
-                .rest_execution_state
-                .unresolved_orders
-                .lock()
-                .is_empty();
+            .load(Ordering::Acquire);
         set_rest_fallback_active(
             &self.rest_execution_state,
             recovery_pending,
@@ -1211,6 +1435,7 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        self.note_reconciliation_application();
         let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         if order.is_closed() {
@@ -1235,37 +1460,41 @@ impl ExecutionClient for DeriveExecutionClient {
         }
 
         let use_rest_fallback = self.should_use_rest_fallback();
-        // Reduce-only submits cannot increase exposure (the venue refuses them
-        // when they would), so unrelated account-wide uncertainty must not
-        // block the de-risking lever this failover exists to preserve.
+        // Reduce-only submits cannot increase exposure — the venue refuses a
+        // reduce-only order that would — so they are deliberately exempt from
+        // the private-state freshness and quote gates, and from unrelated
+        // account-wide uncertainty. That asymmetry rests entirely on the venue
+        // enforcing `reduce_only`, and it is what keeps the de-risking lever
+        // available during exactly the outage this failover exists for. The
+        // local position view may be stale while such an order is sent.
         let write_kind = if order.is_reduce_only() {
             RestWriteKind::ReducingSubmit
         } else {
             RestWriteKind::RiskIncreasingSubmit
         };
         let cached_quote_ts_event = self.cached_quote_ts_event(&cmd.instrument_id);
-        if use_rest_fallback {
-            let reason = if is_trigger_order {
-                Some("Derive trigger order submission is unsupported during REST fallback")
-            } else if write_kind.is_risk_increasing()
-                && !self.rest_entry_gate_open(cached_quote_ts_event)
-            {
-                log_rest_write_halted(
-                    &self.rest_execution_state,
-                    order.client_order_id(),
-                    write_kind,
-                    REST_GATE_PRIVATE_STATE,
-                    cached_quote_ts_event,
-                    self.clock.get_time_ns().as_u64(),
-                );
-                Some(REST_GATE_PRIVATE_STATE)
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                self.emitter.emit_order_denied(&order, reason);
-                return Ok(());
-            }
+        let gate_reason = if is_trigger_order && use_rest_fallback {
+            Some("Derive trigger order submission is unsupported during REST fallback")
+        } else if !write_kind.is_risk_increasing() {
+            None
+        } else if use_rest_fallback {
+            self.risk_increasing_write_blocked(cached_quote_ts_event)
+        } else {
+            // Routing is over the WebSocket, where freshness gates do not
+            // apply, but an unresolved write still halts new exposure.
+            self.unresolved_write_halt()
+        };
+        if let Some(reason) = gate_reason {
+            log_rest_write_halted(
+                &self.rest_execution_state,
+                order.client_order_id(),
+                write_kind,
+                reason,
+                cached_quote_ts_event,
+                self.clock.get_time_ns().as_u64(),
+            );
+            self.emitter.emit_order_denied(&order, reason);
+            return Ok(());
         }
 
         // Spot has no position to reduce; the venue rejects reduce-only
@@ -1337,9 +1566,10 @@ impl ExecutionClient for DeriveExecutionClient {
         let max_account_state_age_secs = self.config.max_account_state_age_secs;
         let rest_fallback_enabled = self.config.rest_fallback_enabled;
         // The quote age bound belongs to the fallback feature, so the
-        // default-off WebSocket-only path keeps its existing behaviour.
+        // default-off WebSocket-only path keeps its existing behaviour. It is
+        // the dedicated execution quote bound, never the account-state bound.
         let quote_max_age_secs = rest_fallback_enabled
-            .then_some(max_account_state_age_secs)
+            .then_some(self.config.max_quote_age_secs)
             .flatten();
 
         self.spawn_task("submit_order", async move {
@@ -1610,7 +1840,7 @@ impl ExecutionClient for DeriveExecutionClient {
                             order_for_task.client_order_id(),
                         );
                         if rest_fallback_enabled {
-                            record_unresolved_ws_write(
+                            record_unresolved_write(
                                 &rest_execution_state,
                                 order_for_task.client_order_id(),
                                 None,
@@ -1712,16 +1942,19 @@ impl ExecutionClient for DeriveExecutionClient {
             if use_rest_fallback {
                 let now_ns = clock.get_time_ns().as_u64();
                 let quote_ts_event = refreshed_quote_ts_event.or(cached_quote_ts_event);
-                let operation_id = match reserve_rest_write(
+                let token = match reserve_write(
                     &rest_execution_state,
                     order_for_task.client_order_id(),
                     None,
                     write_kind,
                     quote_ts_event,
                     now_ns,
-                    max_account_state_age_secs,
+                    FreshnessBounds {
+                        private_state_secs: max_account_state_age_secs,
+                        quote_secs: quote_max_age_secs,
+                    },
                 ) {
-                    Ok(operation_id) => operation_id,
+                    Ok(token) => Some(token),
                     Err(reason) => {
                         log_rest_write_halted(
                             &rest_execution_state,
@@ -1743,10 +1976,10 @@ impl ExecutionClient for DeriveExecutionClient {
                             order_for_task.client_order_id(),
                             venue_order_id,
                         );
-                        resolve_rest_write(
+                        resolve_write(
                             &rest_execution_state,
                             &order_for_task.client_order_id(),
-                            operation_id,
+                            token,
                         );
                         let ts_now = clock.get_time_ns();
                         ensure_accepted_emitted(
@@ -1765,12 +1998,18 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Derive REST submit for {} returned ambiguous outcome: {e}; awaiting reconciliation",
                             order_for_task.client_order_id(),
                         );
-                    }
-                    Err(e) => {
-                        resolve_rest_write(
+                        mark_write_ambiguous(
                             &rest_execution_state,
                             &order_for_task.client_order_id(),
-                            operation_id,
+                            token,
+                            clock.get_time_ns().as_u64(),
+                        );
+                    }
+                    Err(e) => {
+                        resolve_write(
+                            &rest_execution_state,
+                            &order_for_task.client_order_id(),
+                            token,
                         );
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
@@ -1813,7 +2052,7 @@ impl ExecutionClient for DeriveExecutionClient {
                     // the uncertainty or that command would pass the entry gate
                     // while a possibly-live WebSocket order exists.
                     if rest_fallback_enabled {
-                        record_unresolved_ws_write(
+                        record_unresolved_write(
                             &rest_execution_state,
                             order_for_task.client_order_id(),
                             None,
@@ -1856,6 +2095,7 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        self.note_reconciliation_application();
         let use_rest_fallback = self.should_use_rest_fallback();
         let http_client = self.http_client.clone();
         let ws_exec = self.ws_exec.clone();
@@ -1880,7 +2120,7 @@ impl ExecutionClient for DeriveExecutionClient {
             .order(&client_order_id)
             .is_some_and(|order| !order.is_closed() && order.venue_order_id() == venue_order_id);
 
-        let mut cancel_operation_id = 0_u64;
+        let mut cancel_token: Option<OperationToken> = None;
         if use_rest_fallback {
             let reason = if is_trigger_order {
                 Some("Derive trigger-order cancellation is unsupported during REST fallback")
@@ -1894,17 +2134,17 @@ impl ExecutionClient for DeriveExecutionClient {
                 // Cancellation is exposure-reducing, so it needs only this
                 // order's own outcome to be resolved; it is deliberately not
                 // gated on account-wide freshness.
-                match reserve_rest_write(
+                match reserve_write(
                     &self.rest_execution_state,
                     client_order_id,
                     venue_order_id,
                     RestWriteKind::Cancel,
                     None,
                     self.clock.get_time_ns().as_u64(),
-                    self.config.max_account_state_age_secs,
+                    self.freshness_bounds(),
                 ) {
-                    Ok(operation_id) => {
-                        cancel_operation_id = operation_id;
+                    Ok(token) => {
+                        cancel_token = Some(token);
                         None
                     }
                     Err(reason) => Some(reason),
@@ -1930,11 +2170,7 @@ impl ExecutionClient for DeriveExecutionClient {
                 let Some(resolved_venue_order_id) = venue_order_id else {
                     let reason = "Derive REST cancellation requires a resolved venue_order_id";
                     log::warn!("Cannot cancel {client_order_id}: {reason}");
-                    resolve_rest_write(
-                        &rest_execution_state,
-                        &client_order_id,
-                        cancel_operation_id,
-                    );
+                    resolve_write(&rest_execution_state, &client_order_id, cancel_token);
                     emitter.emit_order_cancel_rejected_event(
                         strategy_id,
                         instrument_id,
@@ -1956,23 +2192,21 @@ impl ExecutionClient for DeriveExecutionClient {
                     Ok(_) => {
                         // The venue confirmed the cancellation, so this write's
                         // outcome is known and must not keep the gate closed.
-                        resolve_rest_write(
-                            &rest_execution_state,
-                            &client_order_id,
-                            cancel_operation_id,
-                        );
+                        resolve_write(&rest_execution_state, &client_order_id, cancel_token);
                     }
                     Err(e) if e.is_ambiguous_write_outcome() => {
                         log::warn!(
                             "Derive REST cancel for {client_order_id} returned ambiguous outcome: {e}; awaiting reconciliation",
                         );
-                    }
-                    Err(e) => {
-                        resolve_rest_write(
+                        mark_write_ambiguous(
                             &rest_execution_state,
                             &client_order_id,
-                            cancel_operation_id,
+                            cancel_token,
+                            clock.get_time_ns().as_u64(),
                         );
+                    }
+                    Err(e) => {
+                        resolve_write(&rest_execution_state, &client_order_id, cancel_token);
                         emitter.emit_order_cancel_rejected_event(
                             strategy_id,
                             instrument_id,
@@ -2109,7 +2343,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         "Derive cancel for {client_order_id} returned ambiguous WS outcome: {e}; awaiting reconciliation",
                     );
                     if rest_fallback_enabled {
-                        record_unresolved_ws_write(
+                        record_unresolved_write(
                             &rest_execution_state,
                             client_order_id,
                             venue_order_id,
@@ -2254,6 +2488,7 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        self.note_reconciliation_application();
         let use_rest_fallback = self.should_use_rest_fallback();
         let ts_now = self.clock.get_time_ns();
 
@@ -2304,35 +2539,33 @@ impl ExecutionClient for DeriveExecutionClient {
         let write_kind = replace_write_kind(&order, target_quantity, target_price);
         let cached_quote_ts_event = self.cached_quote_ts_event(&cmd.instrument_id);
 
-        if use_rest_fallback {
-            let reason = if order.venue_order_id() != Some(venue_order_id) {
-                Some("Derive REST replace requires the current resolved venue_order_id")
-            } else if write_kind.is_risk_increasing()
-                && !self.rest_entry_gate_open(cached_quote_ts_event)
-            {
-                log_rest_write_halted(
-                    &self.rest_execution_state,
-                    cmd.client_order_id,
-                    write_kind,
-                    REST_GATE_PRIVATE_STATE,
-                    cached_quote_ts_event,
-                    self.clock.get_time_ns().as_u64(),
-                );
-                Some(REST_GATE_PRIVATE_STATE)
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                self.emitter.emit_order_modify_rejected_event(
-                    cmd.strategy_id,
-                    cmd.instrument_id,
-                    cmd.client_order_id,
-                    Some(venue_order_id),
-                    reason,
-                    ts_now,
-                );
-                return Ok(());
-            }
+        let gate_reason = if use_rest_fallback && order.venue_order_id() != Some(venue_order_id) {
+            Some("Derive REST replace requires the current resolved venue_order_id")
+        } else if !write_kind.is_risk_increasing() {
+            None
+        } else if use_rest_fallback {
+            self.risk_increasing_write_blocked(cached_quote_ts_event)
+        } else {
+            self.unresolved_write_halt()
+        };
+        if let Some(reason) = gate_reason {
+            log_rest_write_halted(
+                &self.rest_execution_state,
+                cmd.client_order_id,
+                write_kind,
+                reason,
+                cached_quote_ts_event,
+                self.clock.get_time_ns().as_u64(),
+            );
+            self.emitter.emit_order_modify_rejected_event(
+                cmd.strategy_id,
+                cmd.instrument_id,
+                cmd.client_order_id,
+                Some(venue_order_id),
+                reason,
+                ts_now,
+            );
+            return Ok(());
         }
 
         let venue_symbol = format_venue_symbol(&cmd.instrument_id)?.to_string();
@@ -2355,6 +2588,7 @@ impl ExecutionClient for DeriveExecutionClient {
         let voi_str = venue_order_id.to_string();
         let rest_execution_state = Arc::clone(&self.rest_execution_state);
         let max_account_state_age_secs = self.config.max_account_state_age_secs;
+        let quote_max_age_secs = self.config.max_quote_age_secs;
         let rest_fallback_enabled = self.config.rest_fallback_enabled;
 
         self.spawn_task("modify_order", async move {
@@ -2471,19 +2705,22 @@ impl ExecutionClient for DeriveExecutionClient {
                 }
             };
 
-            let mut replace_operation_id = 0_u64;
+            let mut replace_token: Option<OperationToken> = None;
             if use_rest_fallback {
                 let now_ns = clock.get_time_ns().as_u64();
-                match reserve_rest_write(
+                match reserve_write(
                     &rest_execution_state,
                     client_order_id,
                     Some(stale_venue_order_id),
                     write_kind,
                     cached_quote_ts_event,
                     now_ns,
-                    max_account_state_age_secs,
+                    FreshnessBounds {
+                        private_state_secs: max_account_state_age_secs,
+                        quote_secs: quote_max_age_secs,
+                    },
                 ) {
-                    Ok(operation_id) => replace_operation_id = operation_id,
+                    Ok(token) => replace_token = Some(token),
                     Err(reason) => {
                         log_rest_write_halted(
                             &rest_execution_state,
@@ -2552,8 +2789,15 @@ impl ExecutionClient for DeriveExecutionClient {
                 log::warn!(
                     "Derive modify for {client_order_id} returned ambiguous outcome; awaiting reconciliation",
                 );
-                if !use_rest_fallback && rest_fallback_enabled {
-                    record_unresolved_ws_write(
+                if use_rest_fallback {
+                    mark_write_ambiguous(
+                        &rest_execution_state,
+                        &client_order_id,
+                        replace_token,
+                        clock.get_time_ns().as_u64(),
+                    );
+                } else if rest_fallback_enabled {
+                    record_unresolved_write(
                         &rest_execution_state,
                         client_order_id,
                         Some(stale_venue_order_id),
@@ -2577,11 +2821,7 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Skipping private/replace response event for {client_order_id}: an incoming terminal frame already resolved the modify",
                         );
                         if use_rest_fallback {
-                            resolve_rest_write(
-                                &rest_execution_state,
-                                &client_order_id,
-                                replace_operation_id,
-                            );
+                            resolve_write(&rest_execution_state, &client_order_id, replace_token);
                         }
                         return Ok(());
                     }
@@ -2589,11 +2829,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         "Order replaced: client_order_id={client_order_id}, new venue_order_id={new_voi}",
                     );
                     let ts = clock.get_time_ns();
-                    resolve_rest_write(
-                        &rest_execution_state,
-                        &client_order_id,
-                        replace_operation_id,
-                    );
+                    resolve_write(&rest_execution_state, &client_order_id, replace_token);
                     emitter.emit_order_updated(
                         &order_for_task,
                         new_voi,
@@ -2617,11 +2853,7 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Skipping partial private/replace response for {client_order_id}: an incoming terminal frame already resolved the modify",
                         );
                         if use_rest_fallback {
-                            resolve_rest_write(
-                                &rest_execution_state,
-                                &client_order_id,
-                                replace_operation_id,
-                            );
+                            resolve_write(&rest_execution_state, &client_order_id, replace_token);
                         }
                         return Ok(());
                     }
@@ -2649,11 +2881,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         ts,
                         ts,
                     );
-                    resolve_rest_write(
-                        &rest_execution_state,
-                        &client_order_id,
-                        replace_operation_id,
-                    );
+                    resolve_write(&rest_execution_state, &client_order_id, replace_token);
                     dispatch_state.forget(&client_order_id);
                 }
                 Err(e) => {
@@ -2669,11 +2897,7 @@ impl ExecutionClient for DeriveExecutionClient {
                     }
                     let reason = e;
                     if use_rest_fallback {
-                        resolve_rest_write(
-                            &rest_execution_state,
-                            &client_order_id,
-                            replace_operation_id,
-                        );
+                        resolve_write(&rest_execution_state, &client_order_id, replace_token);
                     }
                     log::debug!("Derive rejected modify for {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
@@ -2792,33 +3016,51 @@ impl RestWriteKind {
     }
 }
 
-/// A write whose venue outcome is unknown.
+/// Ownership token for an [`UnresolvedWrite`].
 ///
-/// The write is never retried. It is resolved only by positive evidence about
-/// the operation itself, or by its absence across
-/// [`REST_ABSENCE_OBSERVATIONS_REQUIRED`] complete reconciliations that each
-/// started at least one settle window after the write (and after one another),
-/// which is what keeps a write that never reached the venue from wedging the
-/// entry gate and WebSocket recovery for the process lifetime.
+/// Only the write that obtained a token may retire its record, so a late
+/// response can never release uncertainty about a different operation. Tokens
+/// start at 1, so no default-initialised value is ever a valid token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperationToken(u64);
+
+/// How far a tracked write has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteStage {
+    /// The request has been sent and no response has been observed yet. A
+    /// request still in flight can land at any moment, so reconciliation
+    /// evidence must never retire it: only its own response may.
+    InFlight,
+    /// The request completed without a definitive verdict. The venue may or may
+    /// not have applied it, and the write is never retried.
+    Ambiguous,
+}
+
+/// A write whose venue outcome is not yet known.
+///
+/// The write is never retried and is resolved **only** by positive evidence
+/// about this exact operation: for a cancel or replace, a terminal report for
+/// the venue order it targeted; for a submit, a report carrying its client
+/// label. There is deliberately no time- or absence-based resolution: no client
+/// polling age can prove that a signed request did not land, and treating an
+/// explicitly live target as proof that its cancellation never happened would
+/// release uncertainty that is still real. An operation that never gains
+/// evidence keeps risk-increasing entries blocked until the process restarts,
+/// and says so at every reconciliation.
 #[derive(Debug, Clone, Copy)]
 struct UnresolvedWrite {
-    /// Monotonic write id, so only the write that recorded an entry can retire
-    /// it. Without it, a stale response could clear a newer operation.
-    operation_id: u64,
+    /// Token identifying the write that recorded this entry.
+    token: OperationToken,
     kind: RestWriteKind,
+    stage: WriteStage,
     /// The venue order this write acted on. `None` for a submit, whose venue
     /// order id is only learned from a definitive response.
     venue_order_id: Option<VenueOrderId>,
     /// Reconciliations started when the write was recorded. A reconciliation
     /// whose snapshots predate the write carries no evidence about it.
     recorded_at_reconciliation: u64,
-    /// Clock time the write was recorded, for the settle window.
+    /// Clock time the write was recorded, for diagnostics.
     recorded_ns: u64,
-    /// Settled complete reconciliations that found no trace of this operation.
-    absent_observations: u32,
-    /// Start time of the last counted absence observation, so two polls inside
-    /// one settle window cannot both count.
-    last_absent_observation_ns: u64,
 }
 
 #[derive(Debug, Default)]
@@ -2830,24 +3072,55 @@ struct RestExecutionState {
     /// *observed* (the account request start), never the time its long history
     /// traversal finished.
     last_private_reconciliation_ns: AtomicU64,
-    /// Whether the engine has applied the last reconciliation's order reports.
-    /// Reports are applied asynchronously, so entries admitted before that
-    /// would be sized against pre-reconciliation state.
-    reports_applied: AtomicBool,
+    /// Generation of the last complete reconciliation whose reports the engine
+    /// has been observed to apply. Reports are applied asynchronously, so
+    /// entries admitted before that would be sized against pre-reconciliation
+    /// state. Compared against [`Self::applied_generation`]'s expectation.
+    applied_generation: AtomicU64,
     /// Reconciliations started so far. An ambiguous write records the current
     /// value so evidence gathered earlier cannot resolve it.
     reconciliations_started: AtomicU64,
-    /// Monotonic source for [`UnresolvedWrite::operation_id`].
-    next_operation_id: AtomicU64,
+    /// Monotonic source for [`OperationToken`]; the first token issued is 1.
+    next_operation_token: AtomicU64,
+    /// Set once the WebSocket session's own recovery has been exhausted, so the
+    /// supervisor task (rather than the socket's internal retry) owns the next
+    /// dial.
+    ws_recovery_exhausted: AtomicBool,
     unresolved_orders: Mutex<AHashMap<ClientOrderId, UnresolvedWrite>>,
-    /// Closed-ness the last complete reconciliation reported per client order
-    /// id, used to decide whether the engine has applied it yet.
-    reported_order_closed: Mutex<AHashMap<ClientOrderId, bool>>,
+    /// What the last complete reconciliation reported, used to decide whether
+    /// the engine has applied that generation yet.
+    reported_state: Mutex<ReconciliationExpectation>,
 }
 
-/// Private-state health required by every risk-increasing write: a complete
-/// reconciliation, observed within the configured maximum age, already applied
-/// by the engine.
+/// Order state one reconciliation reported for a client order id.
+#[derive(Debug, Clone, Copy)]
+struct ReportedOrderState {
+    venue_order_id: VenueOrderId,
+    closed: bool,
+    quantity: Decimal,
+    filled_qty: Decimal,
+    ts_last: UnixNanos,
+}
+
+/// The venue state a reconciliation generation reported, against which the
+/// cache is compared to decide whether the engine has applied it.
+#[derive(Debug, Default)]
+struct ReconciliationExpectation {
+    /// Generation this expectation belongs to; `0` means nothing recorded yet.
+    generation: u64,
+    /// When this generation's oldest snapshot was observed. Local state whose
+    /// last event is newer than this cannot be expected to appear in it.
+    observed_at: UnixNanos,
+    orders: AHashMap<ClientOrderId, ReportedOrderState>,
+    /// Reported open position per instrument as `(side, quantity)`. An
+    /// instrument reported flat is absent from this map.
+    positions: AHashMap<InstrumentId, (PositionSide, Decimal)>,
+}
+
+/// Private-state health required by every risk-increasing write and by either
+/// route back to WebSocket order entry: the last reconciliation was complete,
+/// its oldest snapshot was observed within the configured maximum age, and the
+/// engine has applied that same generation.
 fn private_state_is_fresh(
     state: &RestExecutionState,
     now_ns: u64,
@@ -2860,15 +3133,40 @@ fn private_state_is_fresh(
     observed_ns > 0
         && now_ns.saturating_sub(observed_ns) <= max_age_secs.saturating_mul(1_000_000_000)
         && !state.reconciliation_failed.load(Ordering::Acquire)
-        && state.reports_applied.load(Ordering::Acquire)
+        && reported_generation_is_applied(state)
 }
 
-/// Quote freshness required before a risk-increasing write.
+/// Whether the engine has applied the generation the last complete
+/// reconciliation recorded.
+fn reported_generation_is_applied(state: &RestExecutionState) -> bool {
+    let generation = state.reported_state.lock().generation;
+    generation > 0 && state.applied_generation.load(Ordering::Acquire) == generation
+}
+
+/// Whether any write's outcome is still unknown.
 ///
-/// Derive's execution config carries a single freshness bound
-/// (`max_account_state_age_secs`); private state and quotes are both measured
-/// against it, so an operator sets one maximum staleness for every input an
-/// entry decision depends on. A missing or future-dated quote denies the write.
+/// This is independent of transport routing: a possibly-live order is a
+/// possibly-live order whether it was sent over REST or the WebSocket, so it
+/// must block risk-increasing commands on both paths.
+fn has_unresolved_writes(state: &RestExecutionState) -> bool {
+    !state.unresolved_orders.lock().is_empty()
+}
+
+/// The staleness bounds an admission decision is measured against.
+///
+/// Private state and quotes carry separate bounds on purpose: a generous
+/// account-state age must not silently widen the age of the quote an entry is
+/// priced against.
+#[derive(Debug, Clone, Copy, Default)]
+struct FreshnessBounds {
+    private_state_secs: Option<u64>,
+    quote_secs: Option<u64>,
+}
+
+/// Quote freshness required before a risk-increasing write, measured against
+/// the dedicated execution quote bound rather than the account-state bound, so
+/// a generous account-state age cannot silently widen the quote age an entry is
+/// priced against. A missing or future-dated quote denies the write.
 fn quote_is_fresh(ts_event: Option<UnixNanos>, now_ns: u64, max_age_secs: Option<u64>) -> bool {
     let (Some(ts_event), Some(max_age_secs)) = (ts_event, max_age_secs) else {
         return false;
@@ -2878,92 +3176,128 @@ fn quote_is_fresh(ts_event: Option<UnixNanos>, now_ns: u64, max_age_secs: Option
         && now_ns.saturating_sub(ts_event) <= max_age_secs.saturating_mul(1_000_000_000)
 }
 
-/// Final admission gate for a fallback write, immediately before it is sent.
+/// Admission gate applied immediately before a write is sent, on either
+/// transport.
 ///
-/// On success the write is recorded as unresolved, so a lost or ambiguous
-/// response can never be mistaken for a rejection; the returned operation id
-/// retires that record once the outcome is definitive.
-fn reserve_rest_write(
+/// On success the write is tracked as in-flight, so a lost or ambiguous
+/// response can never be mistaken for a rejection and no concurrent
+/// risk-increasing write slips past while this one's fate is open. The returned
+/// token is the only thing that may later retire the record.
+fn reserve_write(
     state: &RestExecutionState,
     client_order_id: ClientOrderId,
     venue_order_id: Option<VenueOrderId>,
     kind: RestWriteKind,
     quote_ts_event: Option<UnixNanos>,
     now_ns: u64,
-    max_age_secs: Option<u64>,
-) -> Result<u64, &'static str> {
+    bounds: FreshnessBounds,
+) -> Result<OperationToken, &'static str> {
+    let FreshnessBounds {
+        private_state_secs: private_max_age_secs,
+        quote_secs: quote_max_age_secs,
+    } = bounds;
     let mut unresolved = state.unresolved_orders.lock();
 
     if kind.is_risk_increasing() {
-        if !private_state_is_fresh(state, now_ns, max_age_secs) || !unresolved.is_empty() {
+        if !unresolved.is_empty() {
+            return Err(REST_GATE_UNRESOLVED_WRITE);
+        }
+        if !private_state_is_fresh(state, now_ns, private_max_age_secs) {
             return Err(REST_GATE_PRIVATE_STATE);
         }
-        if !quote_is_fresh(quote_ts_event, now_ns, max_age_secs) {
+        if !quote_is_fresh(quote_ts_event, now_ns, quote_max_age_secs) {
             return Err(REST_GATE_QUOTE);
         }
     } else if unresolved.contains_key(&client_order_id) {
         return Err(REST_GATE_UNRESOLVED_ORDER);
     }
 
-    let operation_id = state.next_operation_id.fetch_add(1, Ordering::AcqRel);
+    let token = OperationToken(state.next_operation_token.fetch_add(1, Ordering::AcqRel) + 1);
     unresolved.insert(
         client_order_id,
         UnresolvedWrite {
-            operation_id,
+            token,
             kind,
+            stage: WriteStage::InFlight,
             venue_order_id,
             recorded_at_reconciliation: state.reconciliations_started.load(Ordering::Acquire),
             recorded_ns: now_ns,
-            absent_observations: 0,
-            last_absent_observation_ns: 0,
         },
     );
-    Ok(operation_id)
+    Ok(token)
 }
 
-/// Records a write whose outcome became unknown without passing through
-/// [`reserve_rest_write`] — a WebSocket write whose transport died after the
-/// routing decision was taken. Without this, the next command would be routed
-/// through REST and pass the entry gate while a possibly-live WebSocket order
-/// exists.
-fn record_unresolved_ws_write(
+/// Moves a tracked write from in-flight to ambiguous once its request has
+/// completed without a definitive verdict. Only from this point can
+/// reconciliation evidence resolve it.
+fn mark_write_ambiguous(
+    state: &RestExecutionState,
+    client_order_id: &ClientOrderId,
+    token: Option<OperationToken>,
+    now_ns: u64,
+) {
+    let Some(token) = token else {
+        return;
+    };
+    let mut unresolved = state.unresolved_orders.lock();
+    if let Some(write) = unresolved.get_mut(client_order_id)
+        && write.token == token
+    {
+        write.stage = WriteStage::Ambiguous;
+        write.recorded_ns = now_ns;
+        log::warn!(
+            "Derive {} for {client_order_id} has an unknown venue outcome; risk-increasing writes stay blocked until a venue report resolves it",
+            write.kind.as_str(),
+        );
+    }
+}
+
+/// Records a write whose outcome became unknown without having been reserved —
+/// a WebSocket write that turned ambiguous after its routing decision was
+/// taken. The uncertainty blocks risk-increasing commands on either transport,
+/// including a socket that is still authenticated (a JSON-RPC `-32603` does not
+/// require the transport to drop).
+fn record_unresolved_write(
     state: &RestExecutionState,
     client_order_id: ClientOrderId,
     venue_order_id: Option<VenueOrderId>,
     kind: RestWriteKind,
     now_ns: u64,
 ) {
-    let operation_id = state.next_operation_id.fetch_add(1, Ordering::AcqRel);
+    let token = OperationToken(state.next_operation_token.fetch_add(1, Ordering::AcqRel) + 1);
     let recorded_at_reconciliation = state.reconciliations_started.load(Ordering::Acquire);
     state.unresolved_orders.lock().insert(
         client_order_id,
         UnresolvedWrite {
-            operation_id,
+            token,
             kind,
+            stage: WriteStage::Ambiguous,
             venue_order_id,
             recorded_at_reconciliation,
             recorded_ns: now_ns,
-            absent_observations: 0,
-            last_absent_observation_ns: 0,
         },
     );
     log::warn!(
-        "Derive {} for {client_order_id} returned an ambiguous WebSocket outcome; holding risk-increasing writes until reconciliation resolves it",
+        "Derive {} for {client_order_id} returned an ambiguous outcome; risk-increasing writes stay blocked until a venue report resolves it",
         kind.as_str(),
     );
 }
 
-/// Retires an unresolved write after a definitive outcome. Only the write that
-/// recorded the entry can retire it.
-fn resolve_rest_write(
+/// Retires a tracked write after a definitive outcome. Only the token actually
+/// obtained by that operation retires its record, and a write that never
+/// reserved one (so holds `None`) retires nothing.
+fn resolve_write(
     state: &RestExecutionState,
     client_order_id: &ClientOrderId,
-    operation_id: u64,
+    token: Option<OperationToken>,
 ) {
+    let Some(token) = token else {
+        return;
+    };
     let mut unresolved = state.unresolved_orders.lock();
     if unresolved
         .get(client_order_id)
-        .is_some_and(|write| write.operation_id == operation_id)
+        .is_some_and(|write| write.token == token)
     {
         unresolved.remove(client_order_id);
     }
@@ -3000,10 +3334,11 @@ fn log_rest_write_halted(
     let private_state_age_ns = (observed_ns > 0).then(|| now_ns.saturating_sub(observed_ns));
     let quote_age_ns = quote_ts_event.map(|ts| now_ns.saturating_sub(ts.as_u64()));
     log::warn!(
-        "Derive execution halted for {client_order_id} (state=halted, operation={}, reason={reason}, private_state_age_ns={private_state_age_ns:?}, quote_age_ns={quote_age_ns:?}, reconciliation_failed={}, reports_applied={}, unresolved_writes={})",
+        "Derive execution halted for {client_order_id} (state=halted, operation={}, reason={reason}, private_state_age_ns={private_state_age_ns:?}, quote_age_ns={quote_age_ns:?}, reconciliation_failed={}, applied_generation={}, reported_generation={}, unresolved_writes={})",
         kind.as_str(),
         state.reconciliation_failed.load(Ordering::Acquire),
-        state.reports_applied.load(Ordering::Acquire),
+        state.applied_generation.load(Ordering::Acquire),
+        state.reported_state.lock().generation,
         state.unresolved_orders.lock().len(),
     );
 }
@@ -3019,7 +3354,6 @@ struct DeriveReconciliationContext {
     dispatch_state: Arc<WsDispatchState>,
     rest_execution_state: Arc<RestExecutionState>,
     is_connected: Arc<AtomicBool>,
-    private_state_poll_interval_secs: Option<u64>,
     max_account_state_age_secs: Option<u64>,
 }
 
@@ -3054,46 +3388,55 @@ impl DeriveReconciliationContext {
                 .store(true, Ordering::Release);
             return Err(e);
         }
-        if self
-            .rest_execution_state
-            .reconciliation_failed
-            .load(Ordering::Acquire)
-        {
-            anyhow::bail!("Derive REST recovery reconciliation was incomplete");
-        }
-        if !self
-            .rest_execution_state
-            .unresolved_orders
-            .lock()
-            .is_empty()
-        {
-            anyhow::bail!("Derive REST recovery still has unresolved order outcomes");
+        // Both routes back to WebSocket order entry require the same thing: a
+        // complete reconciliation, observed inside the configured age, that the
+        // engine has applied. An unresolved write deliberately does *not* block
+        // this — routing and admission are separate concerns, and the
+        // unresolved-write gate keeps risk-increasing commands halted on the
+        // WebSocket path too (see `reserve_write`). Blocking recovery on it
+        // instead would strand the client in REST mode for the whole process.
+        if !self.rest_mode_may_exit() {
+            anyhow::bail!("Derive REST recovery reconciliation is not complete, fresh and applied");
         }
         self.is_connected.store(true, Ordering::Release);
         set_rest_fallback_active(
             &self.rest_execution_state,
             false,
-            "post_reconnect_reconciliation_complete",
+            "post_reconnect_reconciliation_complete_fresh_applied",
             self.clock.get_time_ns().as_u64(),
         );
         Ok(())
     }
 
-    /// A write's effect must be visible in the venue's own read APIs before its
-    /// absence is evidence that it never landed.
-    ///
-    /// The window is one full reconciliation cadence plus one full
-    /// account-state freshness bound, so it scales with whatever the operator
-    /// configured and hard-codes no production cadence. `None` when either
-    /// bound is unset, which disables absence-based resolution entirely.
-    fn absence_settle_window_ns(&self) -> Option<u64> {
-        let poll_interval_secs = self.private_state_poll_interval_secs?;
-        let max_age_secs = self.max_account_state_age_secs?;
-        Some(
-            poll_interval_secs
-                .saturating_add(max_age_secs)
-                .saturating_mul(1_000_000_000),
+    /// Whether the last reconciliation is a good enough picture of venue state
+    /// to resume WebSocket order routing.
+    fn rest_mode_may_exit(&self) -> bool {
+        private_state_is_fresh(
+            &self.rest_execution_state,
+            self.clock.get_time_ns().as_u64(),
+            self.max_account_state_age_secs,
         )
+    }
+
+    /// Repeats, once per reconciliation, that a write's outcome is still
+    /// unknown. A silently wedged entry gate is the failure mode that makes
+    /// this state dangerous in production, so it is logged every cycle rather
+    /// than once.
+    fn log_unresolved_writes(&self) {
+        let unresolved = self.rest_execution_state.unresolved_orders.lock();
+        if unresolved.is_empty() {
+            return;
+        }
+        let now_ns = self.clock.get_time_ns().as_u64();
+        for (client_order_id, write) in unresolved.iter() {
+            log::warn!(
+                "Derive execution halted (state=halted): {} for {client_order_id} still has an unknown venue outcome after {} ns (stage={:?}, venue_order_id={:?}); it is never retried and only a venue report for this operation can resolve it. Risk-increasing orders stay blocked; operator action or a process restart is required if no report ever arrives.",
+                write.kind.as_str(),
+                now_ns.saturating_sub(write.recorded_ns),
+                write.stage,
+                write.venue_order_id,
+            );
+        }
     }
 
     async fn reconcile_private_state(&self) -> anyhow::Result<()> {
@@ -3118,23 +3461,23 @@ impl DeriveReconciliationContext {
             self.rest_execution_state
                 .reconciliation_failed
                 .store(true, Ordering::Release);
+            // An incomplete generation is not recorded as an expectation, so
+            // the applied check keeps failing against the last complete one.
             self.rest_execution_state
-                .reports_applied
-                .store(false, Ordering::Release);
+                .applied_generation
+                .store(0, Ordering::Release);
             log::warn!(
                 "Derive private reconciliation incomplete (state=halted, skipped_orders={}, skipped_fills={}, skipped_positions={}); risk-increasing writes stay blocked",
                 completeness.skipped_orders,
                 completeness.skipped_fills,
                 completeness.skipped_positions,
             );
+            self.log_unresolved_writes();
             return Ok(());
         }
 
-        self.resolve_unresolved_writes(&mass_status, reconciliation_index, account_observed_at);
-        self.record_reported_order_states(&mass_status);
-        self.rest_execution_state
-            .reports_applied
-            .store(false, Ordering::Release);
+        self.resolve_unresolved_writes(&mass_status, reconciliation_index);
+        self.record_reported_state(&mass_status, reconciliation_index + 1, account_observed_at);
         self.emitter
             .send_execution_report(ExecutionReport::MassStatus(Box::new(mass_status)));
         self.rest_execution_state
@@ -3150,42 +3493,80 @@ impl DeriveReconciliationContext {
                 .as_u64()
                 .saturating_sub(account_observed_at.as_u64()),
         );
+        self.log_unresolved_writes();
         Ok(())
     }
+    /// Records what this reconciliation generation reported, so the entry gate
+    /// can tell whether the engine has applied it.
+    ///
+    /// Only reports carrying a client order id are usable: an order the engine
+    /// tracks is matched by label, and the per-label expectation is the current
+    /// leg — an open report beats a closed one, and among equally closed
+    /// reports the most recently updated wins — so a closed historical
+    /// replacement leg never stands in for the live replacement.
+    fn record_reported_state(
+        &self,
+        mass_status: &ExecutionMassStatus,
+        generation: u64,
+        observed_at: UnixNanos,
+    ) {
+        let mut reported = self.rest_execution_state.reported_state.lock();
+        reported.generation = generation;
+        reported.observed_at = observed_at;
+        reported.orders.clear();
+        reported.positions.clear();
 
-    /// Records the closed-ness the venue reported per client order id, so the
-    /// entry gate can tell whether the engine has applied this reconciliation.
-    fn record_reported_order_states(&self, mass_status: &ExecutionMassStatus) {
-        let mut reported = self.rest_execution_state.reported_order_closed.lock();
-        reported.clear();
         for (_, report) in mass_status.order_reports() {
-            if let Some(client_order_id) = report.client_order_id {
-                // A label is only treated as closed when every report for it
-                // is, so an open current leg is not masked by a closed
-                // historical replacement leg.
-                let closed = report.order_status.is_closed();
-                reported
-                    .entry(client_order_id)
-                    .and_modify(|existing| *existing = *existing && closed)
-                    .or_insert(closed);
+            let Some(client_order_id) = report.client_order_id else {
+                continue;
+            };
+            let candidate = ReportedOrderState {
+                venue_order_id: report.venue_order_id,
+                closed: report.order_status.is_closed(),
+                quantity: report.quantity.as_decimal(),
+                filled_qty: report.filled_qty.as_decimal(),
+                ts_last: report.ts_last,
+            };
+            let keep_existing = reported
+                .orders
+                .get(&client_order_id)
+                .is_some_and(|existing| {
+                    (!existing.closed && candidate.closed)
+                        || (existing.closed == candidate.closed
+                            && existing.ts_last >= candidate.ts_last)
+                });
+            if !keep_existing {
+                reported.orders.insert(client_order_id, candidate);
             }
+        }
+
+        for report in mass_status.position_reports().values().flatten() {
+            if report.position_side == PositionSide::Flat || report.quantity.is_zero() {
+                continue;
+            }
+            reported.positions.insert(
+                report.instrument_id,
+                (report.position_side, report.quantity.as_decimal()),
+            );
         }
     }
 
-    /// Applies one complete reconciliation's evidence to the unresolved writes.
+    /// Applies one complete reconciliation's evidence to the tracked writes.
     ///
-    /// Resolution is deliberately narrow. A cancel or replace is resolved only
-    /// by a terminal report for the exact venue order it targeted, so a
-    /// terminal report for an older replacement leg sharing the same client
-    /// label cannot release the current leg. A submit is resolved by any report
-    /// carrying its client order id. Anything else must wait for the absence
-    /// rule, which needs [`REST_ABSENCE_OBSERVATIONS_REQUIRED`] settled,
-    /// separated observations before it accepts that the write never landed.
+    /// Resolution requires positive evidence about the exact operation and
+    /// nothing weaker. A cancel or replace is resolved only by a terminal
+    /// report, or a fill, for the venue order it targeted; a submit is resolved
+    /// by any order *or fill* report carrying its client label, because a
+    /// landed submit whose order report was dropped or had its label detached
+    /// still shows up as a fill. A report that merely shows the target alive is
+    /// not evidence that a cancellation never happened, and elapsed time is not
+    /// evidence of anything, so neither resolves a write. An in-flight request
+    /// is never resolved from reconciliation: it can still land at any moment,
+    /// and only its own response may retire it.
     fn resolve_unresolved_writes(
         &self,
         mass_status: &ExecutionMassStatus,
         reconciliation_index: u64,
-        started_at: UnixNanos,
     ) {
         let mut unresolved = self.rest_execution_state.unresolved_orders.lock();
         if unresolved.is_empty() {
@@ -3194,7 +3575,9 @@ impl DeriveReconciliationContext {
 
         let mut closed_by_venue_order_id: AHashMap<VenueOrderId, bool> =
             AHashMap::with_capacity(mass_status.order_reports().len());
-        let mut reported_client_order_ids: AHashSet<ClientOrderId> = AHashSet::new();
+        let mut evidenced_client_order_ids: AHashSet<ClientOrderId> = AHashSet::new();
+        let mut filled_venue_order_ids: AHashSet<VenueOrderId> = AHashSet::new();
+
         for (_, report) in mass_status.order_reports() {
             let closed = report.order_status.is_closed();
             closed_by_venue_order_id
@@ -3202,63 +3585,44 @@ impl DeriveReconciliationContext {
                 .and_modify(|existing| *existing = *existing || closed)
                 .or_insert(closed);
             if let Some(client_order_id) = report.client_order_id {
-                reported_client_order_ids.insert(client_order_id);
+                evidenced_client_order_ids.insert(client_order_id);
             }
         }
 
-        let started_ns = started_at.as_u64();
-        let settle_window_ns = self.absence_settle_window_ns();
+        for fill in mass_status.fill_reports().values().flatten() {
+            filled_venue_order_ids.insert(fill.venue_order_id);
+            if let Some(client_order_id) = fill.client_order_id {
+                evidenced_client_order_ids.insert(client_order_id);
+            }
+        }
 
         unresolved.retain(|client_order_id, write| {
+            if write.stage == WriteStage::InFlight {
+                return true;
+            }
             if write.recorded_at_reconciliation >= reconciliation_index {
                 // These snapshots were requested before the write; they say
                 // nothing about it.
                 return true;
             }
 
-            let resolved_by_evidence = match write.venue_order_id {
+            let resolved = match write.venue_order_id {
                 Some(venue_order_id) => {
                     closed_by_venue_order_id.get(&venue_order_id) == Some(&true)
+                        || filled_venue_order_ids.contains(&venue_order_id)
                 }
-                None => reported_client_order_ids.contains(client_order_id),
+                None => evidenced_client_order_ids.contains(client_order_id),
             };
-            if resolved_by_evidence {
+            if resolved {
                 log::info!(
                     "Derive {} for {client_order_id} resolved by reconciliation evidence",
                     write.kind.as_str(),
                 );
                 return false;
             }
-
-            let Some(settle_window_ns) = settle_window_ns else {
-                return true;
-            };
-            if started_ns < write.recorded_ns.saturating_add(settle_window_ns) {
-                return true;
-            }
-            if write.last_absent_observation_ns != 0
-                && started_ns
-                    < write
-                        .last_absent_observation_ns
-                        .saturating_add(settle_window_ns)
-            {
-                return true;
-            }
-
-            write.last_absent_observation_ns = started_ns;
-            write.absent_observations = write.absent_observations.saturating_add(1);
-            if write.absent_observations < REST_ABSENCE_OBSERVATIONS_REQUIRED {
-                return true;
-            }
-            log::warn!(
-                "Derive {} for {client_order_id} resolved as never placed: absent from {} consecutive settled reconciliations",
-                write.kind.as_str(),
-                write.absent_observations,
-            );
-            false
+            true
         });
     }
-
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
@@ -4782,6 +5146,114 @@ mod tests {
     #[case(OrderType::TrailingStopMarket, false)]
     fn test_is_derive_trigger_order_type(#[case] order_type: OrderType, #[case] expected: bool) {
         assert_eq!(is_derive_trigger_order_type(order_type), expected);
+    }
+
+    #[rstest]
+    fn test_operation_tokens_start_at_one_so_no_default_value_is_valid() {
+        let state = RestExecutionState::default();
+        let token = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-TOKEN-1"),
+            None,
+            RestWriteKind::Cancel,
+            None,
+            0,
+            FreshnessBounds::default(),
+        )
+        .expect("a reducing write needs no freshness");
+        assert_eq!(token, OperationToken(1));
+    }
+
+    #[rstest]
+    fn test_a_write_without_a_token_retires_nothing() {
+        // A WebSocket-routed operation never reserves a REST write, so it holds
+        // no token and must not be able to clear another operation's record.
+        let state = RestExecutionState::default();
+        let client_order_id = ClientOrderId::from("STRAT-TOKEN-NONE");
+        reserve_write(
+            &state,
+            client_order_id,
+            Some(VenueOrderId::from("ord-1")),
+            RestWriteKind::Cancel,
+            None,
+            0,
+            FreshnessBounds::default(),
+        )
+        .expect("reducing write reserved");
+
+        resolve_write(&state, &client_order_id, None);
+
+        assert!(
+            has_unresolved_writes(&state),
+            "an operation with no token must not retire the cancellation's record",
+        );
+    }
+
+    #[rstest]
+    fn test_a_stale_token_does_not_retire_a_newer_operations_record() {
+        let state = RestExecutionState::default();
+        let client_order_id = ClientOrderId::from("STRAT-TOKEN-STALE");
+        let stale = reserve_write(
+            &state,
+            client_order_id,
+            Some(VenueOrderId::from("ord-1")),
+            RestWriteKind::Cancel,
+            None,
+            0,
+            FreshnessBounds::default(),
+        )
+        .expect("first write reserved");
+        // The first write finishes definitively, then a second operation on the
+        // same order takes its own record.
+        resolve_write(&state, &client_order_id, Some(stale));
+        let fresh = reserve_write(
+            &state,
+            client_order_id,
+            Some(VenueOrderId::from("ord-2")),
+            RestWriteKind::Cancel,
+            None,
+            0,
+            FreshnessBounds::default(),
+        )
+        .expect("second write reserved");
+        assert_ne!(stale, fresh);
+
+        resolve_write(&state, &client_order_id, Some(stale));
+
+        assert!(
+            has_unresolved_writes(&state),
+            "a late response must not release uncertainty about a different write",
+        );
+        resolve_write(&state, &client_order_id, Some(fresh));
+        assert!(!has_unresolved_writes(&state));
+    }
+
+    #[rstest]
+    fn test_an_in_flight_write_is_not_resolved_by_reconciliation_evidence() {
+        let state = RestExecutionState::default();
+        let client_order_id = ClientOrderId::from("STRAT-TOKEN-IN-FLIGHT");
+        let token = reserve_write(
+            &state,
+            client_order_id,
+            Some(VenueOrderId::from("ord-1")),
+            RestWriteKind::Cancel,
+            None,
+            0,
+            FreshnessBounds::default(),
+        )
+        .expect("write reserved");
+        assert_eq!(
+            state.unresolved_orders.lock()[&client_order_id].stage,
+            WriteStage::InFlight,
+        );
+
+        mark_write_ambiguous(&state, &client_order_id, Some(token), 1);
+
+        assert_eq!(
+            state.unresolved_orders.lock()[&client_order_id].stage,
+            WriteStage::Ambiguous,
+            "only a completed request becomes resolvable by reconciliation",
+        );
     }
 
     #[rstest]

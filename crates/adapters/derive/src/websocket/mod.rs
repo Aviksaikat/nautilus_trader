@@ -31,11 +31,12 @@ pub mod handler;
 pub mod messages;
 pub mod parse;
 
+pub(crate) use client::SessionEpoch;
 pub use client::{
     DeriveWebSocketClient, DeriveWebSocketSubscriptionHandle, DeriveWsCredentials,
     DeriveWsExecutionHandle,
 };
-pub(crate) use context::{DeriveQuoteHealthHandle, QuoteFeedState, WsMessageContext};
+pub(crate) use context::{QuoteFeedState, WsMessageContext};
 pub use dispatch::{ORDER_DEDUP_CAPACITY, OrderIdentity, TRADE_DEDUP_CAPACITY, WsDispatchState};
 pub use error::DeriveWsError;
 pub use handler::DeriveWsMessage;

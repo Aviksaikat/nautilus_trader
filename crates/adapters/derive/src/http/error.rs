@@ -19,7 +19,10 @@ use nautilus_network::http::HttpClientError;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{common::retry::is_write_outcome_ambiguous_jsonrpc, signing::auth::AuthError};
+use crate::{
+    common::retry::{is_write_outcome_ambiguous_jsonrpc, is_write_outcome_definitive_http_status},
+    signing::auth::AuthError,
+};
 
 /// Result alias for HTTP operations.
 pub type Result<T> = std::result::Result<T, DeriveHttpError>;
@@ -112,21 +115,24 @@ impl DeriveHttpError {
     /// Returns whether a private write may have reached the venue without a
     /// definitive JSON-RPC result.
     ///
-    /// JSON-RPC envelopes defer to the shared code policy in
-    /// [`is_write_outcome_ambiguous_jsonrpc`], so the HTTP write path and the
-    /// WebSocket write path classify the same venue code the same way. Errors
-    /// raised locally before anything was sent (`Auth`, `MissingCredentials`)
-    /// are definitive.
+    /// Both classifications defer to the shared policy in
+    /// [`crate::common::retry`], so the HTTP and WebSocket write paths treat
+    /// the same venue response the same way: JSON-RPC codes follow
+    /// [`is_write_outcome_ambiguous_jsonrpc`] (only `-32603`), and HTTP
+    /// statuses follow [`is_write_outcome_definitive_http_status`] — 4xx
+    /// (gateway, auth, throttling and request-shape rejections, including 408
+    /// and 429) never reached the matching engine, while 5xx may have. Errors
+    /// raised locally before anything was sent (`Auth`,
+    /// `MissingCredentials`) are definitive.
     #[must_use]
     pub fn is_ambiguous_write_outcome(&self) -> bool {
         match self {
             Self::JsonRpc { code, .. } => is_write_outcome_ambiguous_jsonrpc(*code),
+            Self::Http { status, .. } => !is_write_outcome_definitive_http_status(*status),
             Self::MissingCredentials { .. } | Self::Auth(_) => false,
-            Self::Transport(_)
-            | Self::Http { .. }
-            | Self::MissingResult { .. }
-            | Self::Decode(_)
-            | Self::Serde(_) => true,
+            Self::Transport(_) | Self::MissingResult { .. } | Self::Decode(_) | Self::Serde(_) => {
+                true
+            }
         }
     }
 }
@@ -194,6 +200,30 @@ mod tests {
                 data: None,
             }
             .is_ambiguous_write_outcome()
+        );
+    }
+
+    #[rstest]
+    #[case(400, false)]
+    #[case(403, false)]
+    #[case(404, false)]
+    #[case(408, false)]
+    #[case(422, false)]
+    #[case(429, false)]
+    #[case(500, true)]
+    #[case(502, true)]
+    #[case(503, true)]
+    #[case(504, true)]
+    fn test_http_status_write_outcome_follows_shared_policy(
+        #[case] status: u16,
+        #[case] ambiguous: bool,
+    ) {
+        // 4xx responses are thrown out before the matching engine sees them, so
+        // a write that got one definitively did not happen; 5xx may have been
+        // applied before the response failed.
+        assert_eq!(
+            DeriveHttpError::http(status, "body").is_ambiguous_write_outcome(),
+            ambiguous,
         );
     }
 
