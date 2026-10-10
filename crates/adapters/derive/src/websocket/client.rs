@@ -157,13 +157,6 @@ pub(crate) struct SessionEpoch {
     epoch: u64,
 }
 
-#[cfg(test)]
-impl SessionEpoch {
-    pub(crate) fn for_test(generation: u64, epoch: u64) -> Self {
-        Self { generation, epoch }
-    }
-}
-
 /// WebSocket client for the Derive JSON-RPC stream.
 ///
 /// Construct with [`Self::new`] (public-only) or [`Self::with_credentials`]
@@ -1147,6 +1140,14 @@ impl DeriveWebSocketSubscriptionHandle {
             return Ok(());
         }
         let _guard = self.subscription_lock.lock().await;
+        // Sample the session identity the request is actually sent under,
+        // *before* awaiting the response. The generic transport's own
+        // reconnect can advance the epoch while this request is in flight
+        // (the subscription lock only serializes subscribe calls against
+        // each other, not against a transport reconnect), so sampling
+        // after the await would stamp an old-session ACK as belonging to
+        // whatever session happens to be current when the caller resumes.
+        let requested_under = self.current_session_epoch();
         let params = WsSubscribeParams { channels };
         let cmd_tx = self.cmd_tx.read().await.clone();
         let result: WsSubscribeResult = send_request(
@@ -1167,10 +1168,17 @@ impl DeriveWebSocketSubscriptionHandle {
         // replay (bulk) would acknowledge the channel at the venue but
         // leave `confirmed_channels` empty, so `channel_confirmed_for_current_epoch`
         // could never become true for it again.
-        let session_epoch = self.current_session_epoch();
+        //
+        // Only trust the ACK as a confirmation if the session identity is
+        // still the one the request was actually sent under: if the
+        // transport reconnected while this response was in flight, this
+        // ACK cannot be attributed to the new session.
+        let still_current = self.current_session_epoch() == requested_under;
         for channel in confirmed {
             self.subscriptions.insert(channel.clone(), ());
-            self.confirmed_channels.insert(channel, session_epoch);
+            if still_current {
+                self.confirmed_channels.insert(channel, requested_under);
+            }
         }
         failure.map_or(Ok(()), Err)
     }
@@ -1212,6 +1220,9 @@ impl DeriveWebSocketSubscriptionHandle {
 
     async fn send_subscribe(&self, channel: String, params: &WsSubscribeParams) -> Result<()> {
         let _guard = self.subscription_lock.lock().await;
+        // See `subscribe_channels` for why this must be sampled before the
+        // await rather than after.
+        let requested_under = self.current_session_epoch();
         let cmd_tx = self.cmd_tx.read().await.clone();
         let result: WsSubscribeResult = send_request(
             &self.rate_limiter,
@@ -1227,8 +1238,9 @@ impl DeriveWebSocketSubscriptionHandle {
 
         if confirmed.iter().any(|topic| topic == &channel) {
             self.subscriptions.insert(channel.clone(), ());
-            self.confirmed_channels
-                .insert(channel, self.current_session_epoch());
+            if self.current_session_epoch() == requested_under {
+                self.confirmed_channels.insert(channel, requested_under);
+            }
         }
         failure.map_or(Ok(()), Err)
     }
@@ -2174,6 +2186,12 @@ mod tests {
     use super::*;
     use crate::common::rate_limit::RateBucket;
 
+    impl SessionEpoch {
+        pub(crate) fn for_test(generation: u64, epoch: u64) -> Self {
+            Self { generation, epoch }
+        }
+    }
+
     #[rstest]
     fn test_session_epoch_distinguishes_rebuilt_transport_from_bare_epoch_collision() {
         // F6: a rebuilt transport's own epoch restarts at the same values
@@ -2429,6 +2447,119 @@ mod tests {
         assert!(
             rate_limiter.check_bucket(RateBucket::Matching).is_err(),
             "reserved send must not consume a second cell",
+        );
+    }
+
+    fn test_subscription_handle(
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+        connection_epoch: Arc<ArcSwap<AtomicU64>>,
+        transport_generation: Arc<AtomicU64>,
+        confirmed_channels: Arc<DashMap<String, SessionEpoch>>,
+    ) -> DeriveWebSocketSubscriptionHandle {
+        DeriveWebSocketSubscriptionHandle {
+            cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
+            subscriptions: Arc::new(DashMap::new()),
+            confirmed_channels,
+            subscription_lock: Arc::new(tokio::sync::Mutex::new(())),
+            request_timeout: Duration::from_secs(1),
+            rate_limiter: Arc::new(FixedWindowLimiter::new(
+                FixedWindowLimits::websocket(None, None),
+                MonotonicClock {},
+            )),
+            connection_epoch,
+            transport_generation,
+            connection_mode: Arc::new(ArcSwap::new(Arc::new(AtomicU8::new(
+                ConnectionMode::Active as u8,
+            )))),
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_subscribe_channels_discards_confirmation_when_session_changes_during_the_await() {
+        // R6: the session identity must be sampled *before* sending the
+        // request, not after awaiting the response. Otherwise, a
+        // reconnect that advances the session while an old-session ACK
+        // is still in flight gets that stale ACK stamped as belonging to
+        // the new session: `channel_confirmed_for_current_epoch` would
+        // then wrongly pass for a channel the *current* session never
+        // actually acknowledged.
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        let connection_epoch = Arc::new(ArcSwap::new(Arc::new(AtomicU64::new(0))));
+        let transport_generation = Arc::new(AtomicU64::new(1));
+        let confirmed_channels: Arc<DashMap<String, SessionEpoch>> = Arc::new(DashMap::new());
+        let handle = test_subscription_handle(
+            cmd_tx,
+            Arc::clone(&connection_epoch),
+            Arc::clone(&transport_generation),
+            Arc::clone(&confirmed_channels),
+        );
+
+        // Simulate a reconnect advancing the session identity while this
+        // request is in flight, then let the (now old-session) ACK
+        // complete the response the caller is awaiting.
+        tokio::spawn(async move {
+            if let Some(HandlerCommand::Request { response_tx, .. }) = cmd_rx.recv().await {
+                transport_generation.fetch_add(1, Ordering::AcqRel);
+                connection_epoch.store(Arc::new(AtomicU64::new(0)));
+                let _ = response_tx.send(Ok(
+                    serde_json::json!({"channels": ["ticker_slim.ETH-PERP.1000"]}),
+                ));
+            }
+        });
+
+        handle
+            .subscribe_channels(vec!["ticker_slim.ETH-PERP.1000"])
+            .await
+            .expect("mock ACK accepts the channel");
+
+        assert!(
+            confirmed_channels
+                .get("ticker_slim.ETH-PERP.1000")
+                .is_none(),
+            "an ACK for a request sent under the old session must not be recorded as a \
+             confirmation under whatever session happens to be current when the caller resumes",
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_send_subscribe_discards_confirmation_when_session_changes_during_the_await() {
+        // Same as the bulk-subscribe case above, for the single-channel
+        // path (`subscribe_ticker`/`subscribe_orderbook`/etc., which all
+        // go through `send_subscribe`).
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        let connection_epoch = Arc::new(ArcSwap::new(Arc::new(AtomicU64::new(0))));
+        let transport_generation = Arc::new(AtomicU64::new(1));
+        let confirmed_channels: Arc<DashMap<String, SessionEpoch>> = Arc::new(DashMap::new());
+        let handle = test_subscription_handle(
+            cmd_tx,
+            Arc::clone(&connection_epoch),
+            Arc::clone(&transport_generation),
+            Arc::clone(&confirmed_channels),
+        );
+
+        tokio::spawn(async move {
+            if let Some(HandlerCommand::Request { response_tx, .. }) = cmd_rx.recv().await {
+                transport_generation.fetch_add(1, Ordering::AcqRel);
+                connection_epoch.store(Arc::new(AtomicU64::new(0)));
+                let _ = response_tx.send(Ok(
+                    serde_json::json!({"channels": ["ticker_slim.ETH-PERP.1000"]}),
+                ));
+            }
+        });
+
+        handle
+            .subscribe_ticker("ETH-PERP", "1000")
+            .await
+            .expect("mock ACK accepts the channel");
+
+        assert!(
+            confirmed_channels
+                .get("ticker_slim.ETH-PERP.1000")
+                .is_none(),
+            "an ACK for a request sent under the old session must not be recorded as a \
+             confirmation under whatever session happens to be current when the caller resumes",
         );
     }
 }

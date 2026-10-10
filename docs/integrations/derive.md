@@ -712,11 +712,15 @@ example, a transport error or timeout where the venue's acceptance of the reques
 confirmed) blocks new risk-increasing orders for the affected client. This is a deliberate
 fail-closed stance: an unresolved write is treated as "maybe live" until proven otherwise, never as
 rejected. The block is lifted **only** by a definitive, positive venue report naming that specific
-write (a mass status, order report, or fill that resolves it one way or the other) — never by a
-timeout or by the absence of the order from a private-state read, since an absent-looking read does
-not prove the write never reached the venue. If the venue never produces that definitive evidence,
-the block persists for the life of the process; restarting the client is the only other way to
-clear it.
+write — never by a timeout or by the absence of the order from a private-state read, since an
+absent-looking read does not prove the write never reached the venue. What counts as that
+definitive report depends on the write: for a **submit**, any report naming the resulting order
+(including a fill) proves the submission reached the venue. For a **cancel or replace**, only a
+**terminal** report of the targeted order (closed, or — for a replace — the replacement order
+reported) resolves it; an arbitrary fill on the target is not evidence that a cancel or replace
+against it was ever applied, since the target can legitimately keep filling while that cancel or
+replace is still outstanding. If the venue never produces that definitive evidence, the block
+persists for the life of the process; restarting the client is the only other way to clear it.
 
 **Unsupported during execution REST fallback:**
 
@@ -726,12 +730,16 @@ clear it.
 These are rejected explicitly rather than silently degraded; reduce-only submits and per-order
 `cancel_order` remain available so a position can still be de-risked during the outage.
 
-**Reduce-only submits bypass the freshness and quote gates by design.** A reduce-only order cannot
-increase exposure — Derive refuses a reduce-only order that would — so these submits are
-deliberately exempt from the private-state freshness gate, the quote-age gate, and unrelated
-account-wide ambiguity, keeping the de-risking lever available during exactly the outage this
-failover exists for. That asymmetry rests entirely on the venue enforcing `reduce_only`; the local
-position view may be stale while such an order is sent.
+**Reduce-only submits bypass the entry-side risk gates by design, but not market-order pricing.**
+A reduce-only order cannot increase exposure — Derive refuses a reduce-only order that would — so
+these submits are deliberately exempt from the private-state freshness gate, the risk-increasing
+quote-age gate, and unrelated account-wide ambiguity, keeping the de-risking lever available during
+exactly the outage this failover exists for. That asymmetry rests entirely on the venue enforcing
+`reduce_only`; the local position view may be stale while such an order is sent. This exemption
+does **not** extend to pricing a reduce-only **market** order: signing it still requires refreshing
+and validating a usable direct-ticker quote (bounded by `max_quote_age_secs`), exactly as for any
+other market order, because there is no price to sign against otherwise. A reduce-only limit order
+carries its own price and so needs no such refresh.
 
 **Polling cadence shares one rate budget with private-state reconciliation.** Market-data polling
 and execution's private-state polling both draw from the same per-wallet/IP non-matching allowance

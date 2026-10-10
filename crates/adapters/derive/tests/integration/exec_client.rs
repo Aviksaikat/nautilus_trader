@@ -75,17 +75,20 @@ use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     data::QuoteTick,
     enums::{
-        AccountType, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
-        TriggerType,
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+        TimeInForce, TriggerType,
     },
-    events::{AccountState, OrderAccepted, OrderEventAny, OrderInitialized, OrderUpdated},
+    events::{
+        AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderInitialized, OrderUpdated,
+    },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TradeId,
-        TraderId, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
+        TradeId, TraderId, VenueOrderId,
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder},
+    position::Position,
     reports::{OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_network::{http::HttpClient, websocket::TransportBackend};
 use rstest::rstest;
@@ -154,11 +157,17 @@ struct RestState {
     /// When non-zero, `private/order` answers with this HTTP status instead of
     /// a JSON-RPC body.
     submit_http_status: Arc<AtomicUsize>,
+    /// Delay applied to `public/get_instrument`, so a command can be parked in
+    /// its asynchronous preparation while another write completes.
+    get_instrument_delay_ms: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
 struct WsState {
     connection_count: Arc<AtomicUsize>,
+    /// Monotonic count of accepted upgrades, never decremented, so a test can
+    /// prove a *new dial* happened rather than observing live connections.
+    dial_count: Arc<AtomicUsize>,
     initial_handshake_failures: Arc<AtomicUsize>,
     disconnect_now: Arc<AtomicBool>,
     login_delay_ms: Arc<AtomicUsize>,
@@ -202,6 +211,7 @@ impl Default for WsState {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         Self {
             connection_count: Arc::new(AtomicUsize::new(0)),
+            dial_count: Arc::new(AtomicUsize::new(0)),
             initial_handshake_failures: Arc::new(AtomicUsize::new(0)),
             disconnect_now: Arc::new(AtomicBool::new(false)),
             login_delay_ms: Arc::new(AtomicUsize::new(0)),
@@ -574,6 +584,10 @@ async fn handle_get_instrument(
 ) -> Response {
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     state.get_instrument_calls.lock().await.push(parsed.clone());
+    let delay_ms = state.get_instrument_delay_ms.load(Ordering::SeqCst);
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+    }
     let response = state.get_instrument_response.lock().await.clone();
     let mut result = if response.is_null() {
         sample_instrument_json()
@@ -637,6 +651,7 @@ async fn handle_ws_upgrade(ws: WebSocketUpgrade, State(state): State<WsState>) -
 
 async fn handle_ws(mut socket: WebSocket, state: WsState) {
     state.connection_count.fetch_add(1, Ordering::SeqCst);
+    state.dial_count.fetch_add(1, Ordering::SeqCst);
 
     // Take the notification receiver on connect; the test's `push_notification`
     // sends Values that get forwarded to the client as subscription frames.
@@ -2054,15 +2069,18 @@ async fn test_in_flight_write_is_never_released_by_empty_reconciliations() {
     let ws_state = WsState::default();
     let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
         config.private_state_poll_interval_secs = Some(1);
-        config.max_account_state_age_secs = Some(30);
+        // Two seconds, so the eight-second hold below spans more than two of
+        // the removed rule's settle windows (poll + max age) and would have
+        // seen that rule release a request that was still in flight.
+        config.max_account_state_age_secs = Some(2);
         config.max_quote_age_secs = Some(30);
         // The request must outlive several reconciliations without the client
         // timing it out, so the test observes a genuinely in-flight write.
-        config.http_timeout_secs = 30;
+        config.http_timeout_secs = 60;
         config
     })
     .await;
-    rest_state.submit_delay_ms.store(5_000, Ordering::SeqCst);
+    rest_state.submit_delay_ms.store(8_000, Ordering::SeqCst);
 
     let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
     add_fresh_quote_to_cache(&tc.cache, instrument_id);
@@ -2089,14 +2107,19 @@ async fn test_in_flight_write_is_never_released_by_empty_reconciliations() {
     )
     .await;
 
-    // Several complete reconciliations run while the request is still in flight.
+    // Several complete reconciliations run while the request is still in
+    // flight, spanning more than two settle windows of the removed rule.
+    let sent_at = std::time::Instant::now();
     let polls_before = rest_state.order_history_calls.lock().await.len();
-    wait_until(
+    wait_until_async(
         || {
             let state = rest_state.clone();
-            async move { state.order_history_calls.lock().await.len() >= polls_before + 3 }
+            async move {
+                state.order_history_calls.lock().await.len() >= polls_before + 5
+                    && sent_at.elapsed() >= Duration::from_millis(7_000)
+            }
         },
-        "complete empty reconciliations while the write is in flight",
+        Duration::from_secs(25),
     )
     .await;
 
@@ -2123,8 +2146,9 @@ async fn test_in_flight_write_is_never_released_by_empty_reconciliations() {
     assert_eq!(rest_state.submitted_orders.lock().await.len(), 1);
 
     // The held request finally lands and is applied once.
-    let accepted = drain_until(
+    let accepted = drain_until_with_deadline(
         &mut tc.rx,
+        Duration::from_secs(20),
         |event| matches!(event, ExecutionEvent::Order(OrderEventAny::Accepted(_))),
         "OrderAccepted once the held write returns",
     )
@@ -2174,9 +2198,13 @@ async fn test_ambiguous_cancel_of_a_live_target_is_never_released_by_its_continu
         .store(true, Ordering::SeqCst);
 
     let ws_state = WsState::default();
+    // A one-second cadence with a two-second account-state bound: the rule this
+    // design replaced would have retired the write after two settle windows of
+    // poll + max age, so the wait below runs well past that and the halt must
+    // still be in force.
     let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
         config.private_state_poll_interval_secs = Some(1);
-        config.max_account_state_age_secs = Some(30);
+        config.max_account_state_age_secs = Some(2);
         config.max_quote_age_secs = Some(30);
         config
     })
@@ -2223,14 +2251,19 @@ async fn test_ambiguous_cancel_of_a_live_target_is_never_released_by_its_continu
     .await;
 
     // Many reconciliations, every one of them showing the target explicitly
-    // open and the historical leg terminal.
+    // open and the historical leg terminal, spanning more than two of the
+    // removed rule's settle windows.
+    let cancelled_at = std::time::Instant::now();
     let polls_after_cancel = rest_state.order_history_calls.lock().await.len();
-    wait_until(
+    wait_until_async(
         || {
             let state = rest_state.clone();
-            async move { state.order_history_calls.lock().await.len() >= polls_after_cancel + 4 }
+            async move {
+                state.order_history_calls.lock().await.len() >= polls_after_cancel + 4
+                    && cancelled_at.elapsed() >= Duration::from_millis(8_000)
+            }
         },
-        "reconciliations showing the cancellation target still open",
+        Duration::from_secs(20),
     )
     .await;
 
@@ -2438,7 +2471,9 @@ async fn test_healthy_start_then_exhausted_recovery_is_redialled_by_the_supervis
         })
         .await;
     tc.client.connect().await.expect("initial connect succeeds");
-    // Exhaust the transport's own recovery.
+    // Exhaust the transport's own recovery, then wait for it to actually give
+    // up: its login attempts must stop growing, otherwise an ordinary in-place
+    // reconnect could satisfy what follows.
     ws_state
         .login_failures_after_first
         .store(10, Ordering::SeqCst);
@@ -2448,23 +2483,40 @@ async fn test_healthy_start_then_exhausted_recovery_is_redialled_by_the_supervis
             let rest = rest_state.clone();
             async move { !rest.order_history_calls.lock().await.is_empty() }
         },
-        "REST fallback after the session recovery was exhausted",
+        "REST fallback after the session was lost",
     )
     .await;
+    let mut plateau = ws_state.login_frames.lock().await.len();
+    wait_until_async(
+        || {
+            let ws = ws_state.clone();
+            let observed = plateau;
+            async move { ws.login_frames.lock().await.len() == observed }
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    plateau = ws_state.login_frames.lock().await.len();
 
-    // The venue comes back; the supervisor must dial again and reconcile.
-    let connections_before_recovery = ws_state.connection_count.load(Ordering::SeqCst);
+    // The venue comes back. Proof has to be a *new dial*, counted
+    // monotonically, not the live-connection gauge that an in-place reconnect
+    // also moves.
+    let dials_before_recovery = ws_state.dial_count.load(Ordering::SeqCst);
     ws_state
         .login_failures_after_first
         .store(0, Ordering::SeqCst);
     wait_until_async(
         || {
             let ws = ws_state.clone();
-            async move { ws.connection_count.load(Ordering::SeqCst) > connections_before_recovery }
+            async move { ws.dial_count.load(Ordering::SeqCst) > dials_before_recovery }
         },
-        Duration::from_secs(20),
+        Duration::from_secs(25),
     )
     .await;
+    assert!(
+        ws_state.login_frames.lock().await.len() > plateau,
+        "the redial must authenticate a fresh session",
+    );
 
     let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
     add_fresh_quote_to_cache(&tc.cache, instrument_id);
@@ -2568,6 +2620,42 @@ async fn test_ambiguous_submit_is_resolved_by_a_fill_report_alone() {
     )
     .await;
 
+    // The fill resolves the ambiguity, but it has not been applied to the
+    // cache: admitting an entry now would size it against exposure the engine
+    // has not taken on yet.
+    add_fresh_quote_to_cache(&tc.cache, instrument_id);
+    let premature = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-REST-FILL-EVIDENCE-PREMATURE"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(premature.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&premature))
+        .expect("premature entry command handled");
+    let reason = denied_reason(&mut tc.rx, &premature.client_order_id()).await;
+    assert!(
+        reason.contains("fully reconciled private state"),
+        "an unapplied fill must keep the gate closed: {reason}",
+    );
+    assert_eq!(rest_state.submitted_orders.lock().await.len(), 1);
+
+    // Apply the fill the way the engine would.
+    apply_fill_to_cache(
+        &tc.cache,
+        &ambiguous,
+        instrument_id,
+        VenueOrderId::from("ord-fill-evidence-1"),
+        TradeId::from("trade-fill-evidence-1"),
+        Quantity::from("1.000"),
+        Price::from("3500.00"),
+    );
+
     add_fresh_quote_to_cache(&tc.cache, instrument_id);
     let entry = build_limit_order(
         instrument_id,
@@ -2588,7 +2676,7 @@ async fn test_ambiguous_submit_is_resolved_by_a_fill_report_alone() {
             let state = rest_state.clone();
             async move { state.submitted_orders.lock().await.len() >= 2 }
         },
-        "entry admitted after the fill resolved the ambiguous submit",
+        "entry admitted once the resolving fill was applied",
     )
     .await;
     tc.client.disconnect().await.expect("disconnect succeeds");
@@ -2659,6 +2747,369 @@ async fn test_client_error_submit_is_definitive_and_does_not_halt_the_next_entry
             async move { state.submitted_orders.lock().await.len() >= 2 }
         },
         "entry admitted after a definitive rejection",
+    )
+    .await;
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_an_old_partial_fill_does_not_resolve_an_ambiguous_cancel() {
+    // A full-history read keeps returning fills from before the command. A
+    // partial fill on the targeted order is not evidence that its cancellation
+    // took effect — the remainder can still be live.
+    let rest_state = RestState::default();
+    let label = "STRAT-REST-PARTIAL-FILL-CANCEL";
+    let target = "ord-rest-partial-fill-target";
+    let mut open_leg = order_json_with(
+        target,
+        label,
+        "buy",
+        "ETH-PERP",
+        1_700_000_002_000_i64,
+        "open",
+    );
+    // 0.06 ordered, 0.01 already filled, 0.05 still working.
+    open_leg["amount"] = json!("0.06");
+    open_leg["filled_amount"] = json!("0.01");
+    *rest_state.open_orders_response.lock().await = json!({
+        "orders": [open_leg.clone()],
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    *rest_state.order_history_response.lock().await = json!({
+        "orders": [open_leg],
+        "pagination": {"count": 1, "num_pages": 1},
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let mut old_partial_fill =
+        trade_json_with_label("trade-rest-old-partial", target, "ETH-PERP", label);
+    old_partial_fill["trade_amount"] = json!("0.01");
+    old_partial_fill["timestamp"] = json!(1_700_000_001_000_i64);
+    *rest_state.trade_history_response.lock().await = json!({
+        "trades": [old_partial_fill],
+        "pagination": {"count": 1, "num_pages": 1},
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    rest_state
+        .fail_cancel_requests
+        .store(true, Ordering::SeqCst);
+
+    let ws_state = WsState::default();
+    let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
+        config.private_state_poll_interval_secs = Some(1);
+        config.max_account_state_age_secs = Some(30);
+        config.max_quote_age_secs = Some(30);
+        config
+    })
+    .await;
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let client_order_id = ClientOrderId::from(label);
+    let mut cached = build_limit_order(
+        instrument_id,
+        client_order_id,
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("0.060"),
+    );
+    cached = accepted_order(
+        cached,
+        VenueOrderId::from(target),
+        AccountId::from("DERIVE-001"),
+    );
+    add_order_to_cache(&tc.cache, cached, Some(ClientId::from("DERIVE")));
+    tc.client
+        .cancel_order(CancelOrder::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("DERIVE")),
+            StrategyId::from("S-1"),
+            instrument_id,
+            client_order_id,
+            Some(VenueOrderId::from(target)),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("cancel command accepted");
+    wait_until(
+        || {
+            let state = rest_state.clone();
+            async move { !state.cancelled_orders.lock().await.is_empty() }
+        },
+        "ambiguous REST cancel request",
+    )
+    .await;
+
+    let polls_after_cancel = rest_state.order_history_calls.lock().await.len();
+    wait_until(
+        || {
+            let state = rest_state.clone();
+            async move { state.order_history_calls.lock().await.len() >= polls_after_cancel + 3 }
+        },
+        "reconciliations carrying the old partial fill",
+    )
+    .await;
+
+    add_fresh_quote_to_cache(&tc.cache, instrument_id);
+    let entry = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-REST-PARTIAL-FILL-ENTRY"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(entry.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&entry))
+        .expect("entry command handled");
+    let reason = denied_reason(&mut tc.rx, &entry.client_order_id()).await;
+    assert!(
+        reason.contains("unknown venue outcome"),
+        "an old partial fill must not resolve the cancellation: {reason}",
+    );
+    assert!(rest_state.submitted_orders.lock().await.is_empty());
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reported_exposure_absent_from_the_cache_keeps_the_generation_unapplied() {
+    // The venue reports a position the cache does not hold: until the engine
+    // applies it, an entry would be sized against exposure that is missing
+    // locally.
+    let rest_state = RestState::default();
+    *rest_state.positions_response.lock().await = json!({
+        "positions": [sample_position_json("ETH-PERP", "0.06")],
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let ws_state = WsState::default();
+    let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
+        config.private_state_poll_interval_secs = Some(1);
+        config.max_account_state_age_secs = Some(30);
+        config.max_quote_age_secs = Some(30);
+        config
+    })
+    .await;
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    add_fresh_quote_to_cache(&tc.cache, instrument_id);
+    let entry = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-REST-MISSING-EXPOSURE"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(entry.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&entry))
+        .expect("entry command handled");
+
+    let reason = denied_reason(&mut tc.rx, &entry.client_order_id()).await;
+    assert!(
+        reason.contains("fully reconciled private state"),
+        "reported exposure the cache lacks must keep the generation unapplied: {reason}",
+    );
+    assert!(rest_state.submitted_orders.lock().await.is_empty());
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_two_sleeves_summing_to_the_reported_position_are_applied() {
+    // The venue reports one net position per instrument while the cache splits
+    // it across strategy sleeves. Two sleeves of 0.03 must satisfy a reported
+    // 0.06 — comparing each sleeve against the account total would deny every
+    // entry on a correctly reconciled two-sleeve deployment.
+    let rest_state = RestState::default();
+    *rest_state.positions_response.lock().await = json!({
+        "positions": [sample_position_json("ETH-PERP", "0.06")],
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let ws_state = WsState::default();
+    let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
+        config.private_state_poll_interval_secs = Some(1);
+        config.max_account_state_age_secs = Some(30);
+        config.max_quote_age_secs = Some(30);
+        config
+    })
+    .await;
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    for (strategy, sleeve) in [("S-SLEEVE-A", "SLEEVE-A"), ("S-SLEEVE-B", "SLEEVE-B")] {
+        add_long_position_to_cache(
+            &tc.cache,
+            instrument_id,
+            StrategyId::from(strategy),
+            ClientOrderId::new(format!("STRAT-{sleeve}-FILL")),
+            VenueOrderId::new(format!("ord-{sleeve}")),
+            TradeId::new(format!("trade-{sleeve}")),
+            Quantity::from("0.030"),
+        );
+    }
+
+    add_fresh_quote_to_cache(&tc.cache, instrument_id);
+    let entry = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-REST-TWO-SLEEVES-ENTRY"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(entry.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&entry))
+        .expect("entry command accepted");
+
+    wait_until(
+        || {
+            let state = rest_state.clone();
+            async move { !state.submitted_orders.lock().await.is_empty() }
+        },
+        "entry admitted with the reported position split across two sleeves",
+    )
+    .await;
+    assert_eq!(rest_state.submitted_orders.lock().await.len(), 1);
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_a_queued_websocket_entry_never_writes_once_an_earlier_write_turns_ambiguous() {
+    // The second entry clears the gate when it arrives, then parks in its
+    // asynchronous preparation (resolving its instrument). While it waits, the
+    // first write comes back `-32603` on a socket that stays authenticated. The
+    // parked command must be re-gated at its send boundary, not only when it
+    // was received.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    *ws_state.order_reply.lock().await = Some(json!({
+        "error": {"code": -32603, "message": "Internal error"},
+    }));
+    rest_state
+        .get_instrument_delay_ms
+        .store(2_000, Ordering::SeqCst);
+    let mut tc =
+        build_client_with_config(rest_state.clone(), ws_state.clone(), None, |mut config| {
+            config.rest_fallback_enabled = true;
+            config.private_state_poll_interval_secs = Some(1);
+            config.max_account_state_age_secs = Some(30);
+            config.max_quote_age_secs = Some(30);
+            config
+        })
+        .await;
+    tc.client.connect().await.expect("initial connect succeeds");
+
+    // The first order's instrument is already known, so it proceeds straight to
+    // the venue; the queued order's is not, so it parks on the delayed fetch.
+    let eth_instrument: DeriveInstrument =
+        serde_json::from_value(sample_instrument_json()).expect("instrument parses");
+    tc.client.cache_instrument(eth_instrument);
+
+    let eth = InstrumentId::from("ETH-PERP.DERIVE");
+    let btc = InstrumentId::from("BTC-PERP.DERIVE");
+    let first = build_limit_order(
+        eth,
+        ClientOrderId::from("STRAT-WS-QUEUED-A"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    let queued = build_limit_order(
+        btc,
+        ClientOrderId::from("STRAT-WS-QUEUED-B"),
+        OrderSide::Buy,
+        Price::from("3501.00"),
+        Quantity::from("1.000"),
+    );
+    for order in [&first, &queued] {
+        tc.cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .expect("cache insert");
+    }
+
+    // Issue the parked command first so it is already past the synchronous
+    // gate, then the one that will turn ambiguous.
+    tc.client
+        .submit_order(submit_cmd(&queued))
+        .expect("queued submit accepted");
+    tc.client
+        .submit_order(submit_cmd(&first))
+        .expect("first submit accepted");
+
+    let reason = denied_or_rejected_reason(&mut tc.rx, &queued.client_order_id()).await;
+    assert!(
+        reason.contains("unknown venue outcome"),
+        "the queued entry must be halted by the earlier ambiguity: {reason}",
+    );
+    // Well past the delayed instrument fetch the queued command was waiting on.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let writes = ws_state.submitted_orders.lock().await;
+    assert_eq!(writes.len(), 1, "only the first entry may reach the venue");
+    assert_eq!(writes[0]["label"].as_str(), Some("STRAT-WS-QUEUED-A"));
+    drop(writes);
+    assert!(rest_state.submitted_orders.lock().await.is_empty());
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_feature_off_recovery_restores_connected_readiness_after_a_redial() {
+    // With fallback disabled the REST freshness predicates are unset, so
+    // recovery readiness must not depend on them: a terminal session failure
+    // followed by a successful redial has to restore `is_connected`.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let mut tc = build_client(rest_state.clone(), ws_state.clone()).await;
+    assert!(!tc.client.config().rest_fallback_enabled);
+    tc.client.connect().await.expect("initial connect succeeds");
+    assert!(tc.client.is_connected());
+
+    // Exhaust the transport's own recovery: with the feature off this is what
+    // marks the client disconnected.
+    ws_state
+        .login_failures_after_first
+        .store(10, Ordering::SeqCst);
+    ws_state.disconnect_now.store(true, Ordering::SeqCst);
+    wait_until_async(
+        || {
+            let connected = tc.client.is_connected();
+            async move { !connected }
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    // The venue comes back; the supervisor must redial and restore readiness.
+    let dials_before_recovery = ws_state.dial_count.load(Ordering::SeqCst);
+    ws_state
+        .login_failures_after_first
+        .store(0, Ordering::SeqCst);
+    wait_until_async(
+        || {
+            let ws = ws_state.clone();
+            async move { ws.dial_count.load(Ordering::SeqCst) > dials_before_recovery }
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+    wait_until_async(
+        || {
+            let connected = tc.client.is_connected();
+            async move { connected }
+        },
+        Duration::from_secs(20),
     )
     .await;
     tc.client.disconnect().await.expect("disconnect succeeds");
@@ -4014,7 +4465,18 @@ async fn drain_until<F>(
 where
     F: Fn(&ExecutionEvent) -> bool,
 {
-    let deadline = Duration::from_secs(5);
+    drain_until_with_deadline(rx, Duration::from_secs(5), predicate, label).await
+}
+
+async fn drain_until_with_deadline<F>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    deadline: Duration,
+    predicate: F,
+    label: &str,
+) -> ExecutionEvent
+where
+    F: Fn(&ExecutionEvent) -> bool,
+{
     let outcome = tokio::time::timeout(deadline, async {
         loop {
             let event = rx.recv().await?;
@@ -4065,6 +4527,106 @@ async fn drain_denied_without_submitted(
     }
 }
 
+/// Adds a long position for one strategy sleeve, as the engine would after a
+/// fill, so position aggregation across sleeves can be exercised.
+fn add_long_position_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    strategy_id: StrategyId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    trade_id: TradeId,
+    quantity: Quantity,
+) {
+    let derive_instrument: DeriveInstrument =
+        serde_json::from_value(sample_instrument_json()).expect("instrument parses");
+    let instrument = parse_derive_instrument_any(&derive_instrument, UnixNanos::default())
+        .expect("parse succeeds")
+        .expect("instrument produced");
+    cache.borrow_mut().add_instrument(instrument.clone()).ok();
+
+    let fill = OrderFilled::new(
+        TraderId::from("TRADER-001"),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        AccountId::from("DERIVE-001"),
+        trade_id,
+        OrderSide::Buy,
+        OrderType::Limit,
+        quantity,
+        Price::from("3500.00"),
+        Currency::USDC(),
+        LiquiditySide::Taker,
+        UUID4::new(),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+        false,
+        Some(PositionId::new(format!("{instrument_id}-{strategy_id}"))),
+        None,
+        None,
+    );
+    let position = Position::new(&instrument, fill);
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .expect("position insert");
+}
+
+/// Applies an `OrderFilled` to a cached order, standing in for the engine
+/// applying a reported fill.
+fn apply_fill_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    order: &OrderAny,
+    instrument_id: InstrumentId,
+    venue_order_id: VenueOrderId,
+    trade_id: TradeId,
+    last_qty: Quantity,
+    last_px: Price,
+) {
+    // The engine marks an order accepted before applying a fill to it.
+    let _ = cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Accepted(OrderAccepted::new(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument_id,
+            order.client_order_id(),
+            venue_order_id,
+            AccountId::from("DERIVE-001"),
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+        )));
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Filled(OrderFilled::new(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument_id,
+            order.client_order_id(),
+            venue_order_id,
+            AccountId::from("DERIVE-001"),
+            trade_id,
+            order.order_side(),
+            order.order_type(),
+            last_qty,
+            last_px,
+            Currency::USDC(),
+            LiquiditySide::Taker,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+            None,
+            None,
+            None,
+        )))
+        .expect("apply fill to the cache");
+}
+
 /// Seeds a current top-of-book quote, which a risk-increasing write in REST
 /// fallback requires before it may be sent.
 fn add_fresh_quote_to_cache(cache: &Rc<RefCell<Cache>>, instrument_id: InstrumentId) {
@@ -4089,6 +4651,37 @@ fn fresh_ticker_json(instrument_name: &str) -> Value {
         .try_into()
         .expect("clock fits i64");
     sample_ticker_json(instrument_name, now_ms)
+}
+
+/// Drains until `OrderDenied` or `OrderRejected` for `client_order_id` and
+/// returns its reason. A command refused after `OrderSubmitted` was already
+/// emitted surfaces as a rejection rather than a denial.
+async fn denied_or_rejected_reason(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    client_order_id: &ClientOrderId,
+) -> String {
+    let deadline = Duration::from_secs(10);
+    let outcome = tokio::time::timeout(deadline, async {
+        loop {
+            let event = rx.recv().await?;
+            match &event {
+                ExecutionEvent::Order(OrderEventAny::Denied(denied))
+                    if denied.client_order_id == *client_order_id =>
+                {
+                    return Some(denied.reason.to_string());
+                }
+                ExecutionEvent::Order(OrderEventAny::Rejected(rejected))
+                    if rejected.client_order_id == *client_order_id =>
+                {
+                    return Some(rejected.reason.to_string());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or(None);
+    outcome.unwrap_or_else(|| panic!("timeout waiting for a refusal for {client_order_id}"))
 }
 
 /// Drains until `OrderDenied` for `client_order_id` and returns its reason,
@@ -6125,6 +6718,16 @@ async fn test_cancel_order_by_label_jsonrpc_ambiguous_does_not_emit_cancel_rejec
         &mut tc.rx,
         |event| matches!(event, ExecutionEvent::Order(OrderEventAny::Submitted(_))),
         "OrderSubmitted",
+    )
+    .await;
+    // Let the submit actually reach the venue first: an ambiguous cancel halts
+    // risk-increasing writes, including one still queued behind it.
+    wait_until(
+        || {
+            let state = ws_state.clone();
+            async move { !state.submitted_orders.lock().await.is_empty() }
+        },
+        "private/order posted before the cancellation",
     )
     .await;
 
