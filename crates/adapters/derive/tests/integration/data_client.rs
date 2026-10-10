@@ -1262,6 +1262,103 @@ async fn test_initial_retry_task_keeps_reconnecting_after_terminal_stream_failur
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_initial_retry_task_restores_quote_subscription_after_terminal_stream_failure() {
+    // Companion to `test_initial_retry_task_keeps_reconnecting_after_terminal_stream_failure`,
+    // which only proves the retry task dials again. A fresh `connect()`
+    // tears down the old transport's desired-subscription set entirely
+    // (unlike an in-place reconnect, which replays it automatically), so
+    // dialling again is not enough on its own: without replaying active
+    // channels from the data client's own subscription registry, the socket
+    // reconnects with no ticker subscription and WS quote data never
+    // resumes for the rest of the process.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let channel = "ticker_slim.ETH-PERP.1000";
+    ws_state.upgrade_failures.store(1, Ordering::SeqCst);
+    let initial_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    let mut initial_notification = subscription_notification(channel).unwrap();
+    initial_notification["params"]["data"]["instrument_ticker"]["t"] = json!(initial_ms);
+    initial_notification["params"]["data"]["timestamp"] = json!(initial_ms);
+    let restored_ms = initial_ms + 1_000;
+    let mut restored_notification = subscription_notification(channel).unwrap();
+    restored_notification["params"]["data"]["instrument_ticker"]["t"] = json!(restored_ms);
+    restored_notification["params"]["data"]["timestamp"] = json!(restored_ms);
+    ws_state.subscription_notifications.lock().await.insert(
+        channel.to_string(),
+        vec![initial_notification, restored_notification],
+    );
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.rest_market_data_failover_enabled = true;
+    cfg.rest_market_data_poll_interval_ms = Some(20);
+    cfg.rest_market_data_max_quote_age_secs = Some(5);
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+
+    // Initial upgrade fails once; the retry task redials and succeeds.
+    client.connect().await.unwrap();
+    wait_until_async(
+        || {
+            let ws_state = ws_state.clone();
+            async move { ws_state.connection_count.load(Ordering::SeqCst) >= 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    client
+        .subscribe_quotes(subscribe_quotes(instrument_id, None))
+        .unwrap();
+    wait_for_subscribe(&ws_state, channel).await;
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(quote.ts_event.as_u64(), initial_ms as u64 * 1_000_000),
+        other => panic!("expected initial WebSocket quote, was {other:?}"),
+    }
+
+    // Reject exactly `MAX_SESSION_RECOVERY_ATTEMPTS` (3) resubscribe
+    // attempts so in-place session recovery exhausts deterministically,
+    // then the counter naturally reaches zero and rejects nothing further
+    // -- the redial's own resubscribe is therefore the 5th subscribe frame
+    // for this channel (1 initial + 3 rejected recovery attempts + 1
+    // restored), not a racy manual reset against the production task.
+    ws_state.subscribe_failures.store(3, Ordering::SeqCst);
+    let attempts_before_terminal_failure = ws_state.upgrade_attempts.load(Ordering::SeqCst);
+    ws_state.force_disconnect().await;
+
+    wait_until_async(
+        || {
+            let ws_state = ws_state.clone();
+            async move {
+                ws_state.upgrade_attempts.load(Ordering::SeqCst)
+                    >= attempts_before_terminal_failure + 2
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        ws_state.upgrade_attempts.load(Ordering::SeqCst) >= attempts_before_terminal_failure + 2,
+        "the initial retry task must dial again after a terminal recovery failure",
+    );
+
+    wait_for_subscribe_count(&ws_state, channel, 5).await;
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(quote.ts_event.as_u64(), restored_ms as u64 * 1_000_000),
+        other => panic!(
+            "expected the quote subscription to be restored and a fresh WebSocket quote to \
+             flow after the redial, was {other:?}"
+        ),
+    }
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_rest_polling_resumes_immediately_after_transport_disconnect_despite_fresh_quote() {
     // REST polling must react to the transport actually being down, not
     // only to quote staleness: `is_connected` is cleared on a recovery
@@ -1363,6 +1460,106 @@ async fn test_rest_polling_resumes_immediately_after_transport_disconnect_despit
          retrying, not yet exhausted) -- the resumed polling above cannot \
          be explained by is_connected alone",
     );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_rest_polling_starts_during_sustained_upgrade_outage_despite_fresh_quote() {
+    // A sustained upgrade outage (every reconnect attempt 503s, mirroring
+    // the motivating production incident) never installs a new transport,
+    // so the low-level connection epoch never changes -- only the
+    // transport's own connection mode reflects the outage. A poller gated
+    // on epoch alone would keep trusting the last WS quote as "current"
+    // until it ages out, even though the socket has been down the whole
+    // time. This is a distinct scenario from an ordinary disconnect that
+    // successfully redials (which changes the epoch and was already
+    // covered): here the epoch is fixed throughout, so only `is_active()`
+    // can detect the outage.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let now_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    let channel = "ticker_slim.ETH-PERP.1000";
+    let mut ws_notification = subscription_notification(channel).unwrap();
+    ws_notification["params"]["data"]["instrument_ticker"]["t"] = json!(now_ms);
+    ws_notification["params"]["data"]["timestamp"] = json!(now_ms);
+    ws_state
+        .subscription_notifications
+        .lock()
+        .await
+        .insert(channel.to_string(), vec![ws_notification]);
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.rest_market_data_failover_enabled = true;
+    cfg.rest_market_data_poll_interval_ms = Some(20);
+    // Deliberately generous: long enough that the fix must be reacting to
+    // the transport being down, not merely waiting the quote out.
+    cfg.rest_market_data_max_quote_age_secs = Some(30);
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    client
+        .subscribe_quotes(subscribe_quotes(instrument_id, None))
+        .unwrap();
+    wait_for_subscribe(&ws_state, channel).await;
+
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(quote.ts_event.as_u64(), now_ms as u64 * 1_000_000),
+        other => panic!("expected fresh WebSocket quote, was {other:?}"),
+    }
+
+    let fresh_now_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    *rest_state.ticker_response.lock().await = json!({
+        "instrument_name": "ETH-PERP",
+        "best_ask_amount": "1.2",
+        "best_ask_price": "3501.0",
+        "best_bid_amount": "0.8",
+        "best_bid_price": "3499.5",
+        "index_price": "3500.0",
+        "mark_price": "3500.5",
+        "max_price": "5000",
+        "min_price": "100",
+        "timestamp": fresh_now_ms,
+    });
+
+    // Every upgrade attempt from here on 503s, so the transport can never
+    // leave `Reconnect`/`Disconnect` and the connection epoch never moves.
+    ws_state
+        .upgrade_failures
+        .store(usize::MAX, Ordering::SeqCst);
+    let calls_before_disconnect = rest_state.ticker_calls().await.len();
+    ws_state.force_disconnect().await;
+
+    wait_until_async(
+        || {
+            let rest_state = rest_state.clone();
+            async move { rest_state.ticker_calls().await.len() > calls_before_disconnect }
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        rest_state.ticker_calls().await.len() > calls_before_disconnect,
+        "REST polling must start promptly during a sustained upgrade outage, \
+         even though the last WebSocket quote is still within the \
+         configured max age and the connection epoch has not changed",
+    );
+
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(
+            quote.bid_price,
+            Price::from("3499.50"),
+            "the post-request recheck must use the same transport-health \
+             signal as the pre-request check, so the REST quote is \
+             actually published rather than suppressed as \"WS current\"",
+        ),
+        other => panic!("expected a published REST quote, was {other:?}"),
+    }
 
     client.disconnect().await.unwrap();
 }
@@ -1919,6 +2116,118 @@ async fn test_reconnect_before_ack_does_not_publish_prior_session_confirmation()
     );
 
     ws_state.subscribe_response_gate.add_permits(1);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_disconnect_connect_pre_ack_does_not_reuse_stale_confirmation() {
+    // A full disconnect()/connect() rebuilds the transport from scratch, so
+    // the new transport's low-level epoch restarts at zero exactly like the
+    // torn-down transport's did. The prior session's subscription
+    // confirmation must not survive that rebuild: a ticker the venue
+    // replays before the fresh subscribe is acknowledged must not be
+    // published, and REST polling must not stop, even though the old
+    // (now-stale) confirmation shares the rebuilt transport's epoch value.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let channel = "ticker_slim.ETH-PERP.1000";
+    let initial_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    let mut initial_notification = subscription_notification(channel).unwrap();
+    initial_notification["params"]["data"]["instrument_ticker"]["t"] = json!(initial_ms);
+    initial_notification["params"]["data"]["timestamp"] = json!(initial_ms);
+    ws_state
+        .subscription_notifications
+        .lock()
+        .await
+        .insert(channel.to_string(), vec![initial_notification]);
+    let rest_addr = start_rest_server(rest_state.clone()).await;
+    let ws_addr = start_ws_server(ws_state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+
+    let mut cfg = config(rest_addr, ws_addr);
+    cfg.rest_market_data_failover_enabled = true;
+    cfg.rest_market_data_poll_interval_ms = Some(20);
+    cfg.rest_market_data_max_quote_age_secs = Some(5);
+    let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, cfg).unwrap();
+    client.connect().await.unwrap();
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    client
+        .subscribe_quotes(subscribe_quotes(instrument_id, None))
+        .unwrap();
+    wait_for_subscribe(&ws_state, channel).await;
+
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(quote.ts_event.as_u64(), initial_ms as u64 * 1_000_000),
+        other => panic!("expected initial WebSocket quote, was {other:?}"),
+    }
+
+    // Full teardown: drop the first transport entirely instead of merely
+    // forcing a low-level reconnect on the same one.
+    client.disconnect().await.unwrap();
+    while rx.try_recv().is_ok() {}
+
+    // Queue a fresh pre-ack notification and gate the rebuilt transport's
+    // subscribe acknowledgement, exactly as the single-transport reconnect
+    // variant above does.
+    let replay_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    let mut replay_notification = subscription_notification(channel).unwrap();
+    replay_notification["params"]["data"]["instrument_ticker"]["t"] = json!(replay_ms);
+    replay_notification["params"]["data"]["timestamp"] = json!(replay_ms);
+    ws_state
+        .subscription_notifications
+        .lock()
+        .await
+        .insert(channel.to_string(), vec![replay_notification]);
+    ws_state
+        .notification_before_subscribe_response
+        .store(true, Ordering::SeqCst);
+    ws_state
+        .deferred_subscribe_responses
+        .store(1, Ordering::SeqCst);
+
+    client.connect().await.unwrap();
+    client
+        .subscribe_quotes(subscribe_quotes(instrument_id, None))
+        .unwrap();
+    wait_for_subscribe_count(&ws_state, channel, 2).await;
+
+    let rest_ms = get_atomic_clock_realtime().get_time_ms() as i64;
+    *rest_state.ticker_response.lock().await = json!({
+        "instrument_name": "ETH-PERP",
+        "best_ask_amount": "1.2",
+        "best_ask_price": "3501.0",
+        "best_bid_amount": "0.8",
+        "best_bid_price": "3499.5",
+        "index_price": "3500.0",
+        "mark_price": "3500.5",
+        "max_price": "5000",
+        "min_price": "100",
+        "timestamp": rest_ms,
+    });
+
+    match recv_data(&mut rx).await {
+        Data::Quote(quote) => assert_eq!(
+            quote.bid_price,
+            Price::from("3499.50"),
+            "REST polling must still cover the instrument: a pre-ack replay \
+             on the rebuilt transport must not be mistaken for a confirmed \
+             WebSocket subscription",
+        ),
+        other => panic!(
+            "expected a REST quote before the rebuilt transport's subscribe ack, was {other:?}"
+        ),
+    }
+
+    ws_state.subscribe_response_gate.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "pre-ack WebSocket quote on the rebuilt transport must not be published \
+         using the torn-down transport's stale confirmation"
+    );
+
     client.disconnect().await.unwrap();
 }
 
@@ -3316,9 +3625,9 @@ async fn test_request_bars_terminates_at_safety_cap() {
         ))
         .unwrap();
 
-    // The 100-page walk is paced by the non-matching REST quota (10/s after the
-    // 50-request burst), so it takes ~5s; allow well beyond that.
-    let response = recv_response_within(&mut rx, Duration::from_secs(15)).await;
+    // The 100-page walk is paced by the non-matching REST quota (5/s after
+    // the 25-request burst), so it takes ~15s; allow well beyond that.
+    let response = recv_response_within(&mut rx, Duration::from_secs(25)).await;
     let DataResponse::Bars(bars) = response else {
         panic!("expected bars response");
     };

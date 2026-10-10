@@ -495,7 +495,7 @@ window:
 | ---------------------------------- | ---------------------- |
 | Matching (account-wide)            | 5 requests per window  |
 | Per-instrument matching            | 5 requests per window  |
-| REST non-matching (per IP)         | 50 requests per window |
+| REST non-matching (per IP)         | 25 requests per window |
 | WebSocket non-matching (logged in) | 25 requests per window |
 | `private/cancel_all`               | 5 requests per window  |
 | Unscoped `private/cancel_by_label` | 50 requests per window |
@@ -603,6 +603,9 @@ Class/struct: `DeriveDataClientConfig`.
 | `currencies`                       | `[]`      | Currencies to bulk-load on connect. Empty means lazy-load on demand.                        |
 | `include_expired`                  | `false`   | Include expired option rows from `public/get_instruments`.                                  |
 | `auto_load_missing_instruments`    | `true`    | Lazy-load an unknown instrument before sending a subscribe request.                         |
+| `rest_market_data_failover_enabled`| `false`   | Temporary incident workaround; see [REST polling failover](#rest-polling-failover-temporary).|
+| `rest_market_data_poll_interval_ms`| `None`    | REST quote polling interval in milliseconds. Required (and must be positive) when the option above is enabled. |
+| `rest_market_data_max_quote_age_secs`| `None`  | Maximum accepted REST quote age in seconds. Required (and must be positive) when failover is enabled. |
 | `transport_backend`                | `Sockudo` | WebSocket transport when `transport-sockudo` is enabled.                                    |
 
 `auto_load_missing_instruments` covers subscribe commands only. The request commands
@@ -639,6 +642,9 @@ Class/struct: `DeriveExecutionClientConfig`.
 | `max_matching_requests_per_second`                | `None`    | Account-wide matching-engine write requests/sec (order/replace/cancel incl. trigger methods). Defaults to the Trader-tier limit of 1 when unset; raise for Market Maker accounts. |
 | `max_per_instrument_matching_requests_per_second` | `None`    | Per-instrument matching write requests/sec, enforced independently of the account-wide limit. Defaults to the Trader-tier limit of 1 when unset; raise for Market Maker accounts. |
 | `transport_backend`                               | `Sockudo` | WebSocket transport when `transport-sockudo` is enabled.                                                                                                                          |
+| `rest_fallback_enabled`                           | `false`   | Temporary incident workaround; see [REST polling failover](#rest-polling-failover-temporary).                                                                                    |
+| `private_state_poll_interval_secs`                | `None`    | Interval in seconds between private-state reconciliations while REST fallback is active. Required (and must be positive) when the option above is enabled.                      |
+| `max_account_state_age_secs`                      | `None`    | Maximum age in seconds of the last successful private-state reconciliation for allowing risk-increasing orders. Required (and must be positive) when REST fallback is enabled.   |
 
 The default transport falls back to `Tungstenite` when the build disables the
 `transport-sockudo` feature.
@@ -654,6 +660,61 @@ unset:
 
 The session key is the secp256k1 private key registered on the wallet for API signing. The
 `session_key` field is redacted in `Debug` output and Python `repr`.
+
+### REST polling failover (temporary)
+
+A **temporary incident workaround**, not a recommended operating mode: it exists to keep the
+adapter functional through a WebSocket-side outage (for example, a sustained upgrade failure)
+while the REST API still responds normally. Both the data and execution clients default to
+WebSocket-only operation; REST failover is opt-in and must be deliberately enabled per client.
+
+```python
+data_config = DeriveDataClientConfig(
+    environment=DeriveEnvironment.MAINNET,
+    rest_market_data_failover_enabled=True,
+    rest_market_data_poll_interval_ms=20_000,
+    rest_market_data_max_quote_age_secs=60,
+)
+
+exec_config = DeriveExecutionClientConfig(
+    account_id=AccountId("DERIVE-001"),
+    environment=DeriveEnvironment.MAINNET,
+    max_fee_per_contract=Decimal("1000"),
+    rest_fallback_enabled=True,
+    private_state_poll_interval_secs=30,
+    max_account_state_age_secs=90,
+)
+```
+
+**Mandatory positive bounds.** Both halves fail construction if enabled without their interval and
+maximum-age fields set to a value greater than zero: `rest_market_data_poll_interval_ms` and
+`rest_market_data_max_quote_age_secs` for data, `private_state_poll_interval_secs` and
+`max_account_state_age_secs` for execution. None of the four has a built-in default once enabled,
+and this adapter does not ship a recommended production cadence as a default — see
+[Rate limiting](#rate-limiting) and choose polling intervals and maximum ages from the venue's
+documented per-IP and per-wallet limits, sized for however many instruments and accounts the
+deployment actually polls.
+
+**REST recovery behavior.** The data client polls `public/get_ticker` per instrument while a
+WebSocket ticker subscription is missing or its last update exceeds the configured maximum age;
+it reverts to the WebSocket quote as soon as a fresh, confirmed subscription update arrives. The
+execution client polls private state (subaccount, open orders, positions, recent fills) on the
+configured interval while the WebSocket session is unauthenticated or unavailable, and returns to
+WebSocket-only operation once the socket reconnects and reconciliation completes.
+
+**Unresolved-write halting.** A REST order write whose outcome is ambiguous (for example, a
+transport error or timeout where the venue's acceptance of the request cannot be confirmed) blocks
+new risk-increasing orders for the affected client until reconciliation observes a definitive
+report for that order. This is a deliberate fail-closed stance: an unresolved write is treated as
+"maybe live" until proven otherwise, not as rejected.
+
+**Unsupported during execution REST fallback:**
+
+- Trigger-order submission and trigger-order cancellation.
+- `cancel_all_orders` (cancel resolved orders individually instead).
+
+These are rejected explicitly rather than silently degraded; reduce-only submits and per-order
+`cancel_order` remain available so a position can still be de-risked during the outage.
 
 ### Python live node
 

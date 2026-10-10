@@ -84,8 +84,9 @@ pub const DERIVE_DEFAULT_MATCHING_TPS: u32 = 1;
 /// override never inflates this bucket.
 pub const DERIVE_DEFAULT_PER_INSTRUMENT_MATCHING_TPS: u32 = 1;
 
-/// Flat REST non-matching allowance per IP (requests per second).
-pub const DERIVE_NON_MATCHING_TPS: u32 = 10;
+/// Flat REST non-matching allowance per IP (requests per second), per the
+/// documented Trader-tier contract (5 TPS for reads/subscriptions/login).
+pub const DERIVE_NON_MATCHING_TPS: u32 = 5;
 
 /// Default authenticated WebSocket non-matching allowance for a Trader account.
 pub const DERIVE_WEBSOCKET_NON_MATCHING_TPS: u32 = 5;
@@ -516,7 +517,7 @@ mod tests {
     #[rstest]
     fn test_rest_limits_match_documented_trader_contract() {
         let limits = FixedWindowLimits::rest(None, None);
-        assert_eq!(limits.non_matching.get(), 50); // 10 TPS * 5x burst
+        assert_eq!(limits.non_matching.get(), 25); // 5 TPS * 5x burst
         assert_eq!(limits.matching.get(), 5); // 1 TPS * 5x burst
         assert_eq!(limits.per_instrument_matching.get(), 5);
         assert_eq!(limits.cancel_all.get(), 5); // 1 TPS * 5x burst
@@ -895,20 +896,20 @@ mod tests {
     }
 
     #[rstest]
-    fn test_rest_non_matching_quota_is_fifty_per_window() {
+    fn test_rest_non_matching_quota_is_twenty_five_per_window() {
         let limiter = FixedWindowLimiter::new(
             FixedWindowLimits::rest(None, None),
             FakeRelativeClock::default(),
         );
 
-        for _ in 0..50 {
+        for _ in 0..25 {
             limiter
                 .check_bucket(RateBucket::NonMatching)
                 .expect("burst");
         }
         assert!(
             limiter.check_bucket(RateBucket::NonMatching).is_err(),
-            "REST non-matching allowance is 50 per window",
+            "REST non-matching allowance is 25 per window",
         );
     }
 

@@ -19,7 +19,7 @@ use nautilus_network::http::HttpClientError;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::signing::auth::AuthError;
+use crate::{common::retry::is_write_outcome_ambiguous_jsonrpc, signing::auth::AuthError};
 
 /// Result alias for HTTP operations.
 pub type Result<T> = std::result::Result<T, DeriveHttpError>;
@@ -111,12 +111,23 @@ impl DeriveHttpError {
 
     /// Returns whether a private write may have reached the venue without a
     /// definitive JSON-RPC result.
+    ///
+    /// JSON-RPC envelopes defer to the shared code policy in
+    /// [`is_write_outcome_ambiguous_jsonrpc`], so the HTTP write path and the
+    /// WebSocket write path classify the same venue code the same way. Errors
+    /// raised locally before anything was sent (`Auth`, `MissingCredentials`)
+    /// are definitive.
     #[must_use]
     pub fn is_ambiguous_write_outcome(&self) -> bool {
-        !matches!(
-            self,
-            Self::JsonRpc { .. } | Self::MissingCredentials { .. } | Self::Auth(_)
-        )
+        match self {
+            Self::JsonRpc { code, .. } => is_write_outcome_ambiguous_jsonrpc(*code),
+            Self::MissingCredentials { .. } | Self::Auth(_) => false,
+            Self::Transport(_)
+            | Self::Http { .. }
+            | Self::MissingResult { .. }
+            | Self::Decode(_)
+            | Self::Serde(_) => true,
+        }
     }
 }
 
@@ -180,6 +191,20 @@ mod tests {
             !DeriveHttpError::JsonRpc {
                 code: -32602,
                 message: "invalid params".to_string(),
+                data: None,
+            }
+            .is_ambiguous_write_outcome()
+        );
+    }
+
+    #[rstest]
+    fn test_internal_error_write_outcome_is_ambiguous() {
+        // `-32603` is the one venue code whose own process is known to have run
+        // for an unknown distance before failing, so a write may have landed.
+        assert!(
+            DeriveHttpError::JsonRpc {
+                code: -32603,
+                message: "Internal error".to_string(),
                 data: None,
             }
             .is_ambiguous_write_outcome()

@@ -59,3 +59,50 @@ pub(crate) struct QuoteFeedState {
     /// the WS as current before this epoch is reached again.
     pub(crate) ws_epoch: Option<u64>,
 }
+
+/// Read-only, cloneable view of the Derive data client's per-instrument
+/// quote freshness.
+///
+/// The execution client has no direct access to the data client's internal
+/// state and currently infers market-data health only from
+/// [`crate::data::DeriveDataClient::is_connected`], which can report `true`
+/// throughout a REST-failover outage even if no REST poll has ever actually
+/// produced a quote (`rest_failover_active` latches as soon as the initial
+/// WebSocket connect fails, independent of REST poll outcomes). This handle
+/// lets a caller check the venue-observed, per-instrument ground truth
+/// instead: obtain it from [`crate::data::DeriveDataClient::quote_health_handle`]
+/// and share it with whatever needs to gate on "has a quote actually been
+/// seen for this instrument, and how recently" (e.g. the execution client's
+/// "missing required quote disables new entries" check).
+// Not yet called outside this crate's data-client tests: it is staged for
+// the execution client (a separate, concurrently developed file) to consume
+// once wired up. Keep it rather than deleting it as dead code; removing it
+// would hand execution no path to the per-instrument quote evidence the
+// "missing required quote disables new entries" design requirement needs.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct DeriveQuoteHealthHandle {
+    quote_feed_state: Arc<Mutex<ahash::AHashMap<InstrumentId, QuoteFeedState>>>,
+}
+
+#[allow(dead_code)]
+impl DeriveQuoteHealthHandle {
+    pub(crate) fn new(
+        quote_feed_state: Arc<Mutex<ahash::AHashMap<InstrumentId, QuoteFeedState>>>,
+    ) -> Self {
+        Self { quote_feed_state }
+    }
+
+    /// Returns the local receipt time of the most recent successfully
+    /// published quote (WebSocket or REST) for `instrument_id`.
+    ///
+    /// `None` means no quote has ever been published for this instrument —
+    /// including while the data client itself reports connected, since that
+    /// readiness latch does not require a REST poll to have succeeded.
+    pub(crate) fn last_quote_event(&self, instrument_id: InstrumentId) -> Option<UnixNanos> {
+        self.quote_feed_state
+            .lock()
+            .get(&instrument_id)
+            .and_then(|state| state.last_published_event)
+    }
+}

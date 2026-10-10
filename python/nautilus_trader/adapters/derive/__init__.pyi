@@ -147,10 +147,10 @@ class DeriveExecutionClientConfig:
         market_order_slippage_bps: int | None = None,
         max_matching_requests_per_second: int | None = None,
         max_per_instrument_matching_requests_per_second: int | None = None,
+        transport_backend: network.TransportBackend | None = None,
         rest_fallback_enabled: bool | None = None,
         private_state_poll_interval_secs: int | None = None,
         max_account_state_age_secs: int | None = None,
-        transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...

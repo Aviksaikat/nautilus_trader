@@ -1,0 +1,70 @@
+{
+  "result": {
+    "instrument_type": "perp",
+    "instrument_name": "ETH-PERP",
+    "scheduled_activation": 1701840228,
+    "scheduled_deactivation": 9223372036854775807,
+    "is_active": true,
+    "tick_size": "0.01",
+    "minimum_amount": "0.1",
+    "maximum_amount": "10000",
+    "amount_step": "0.001",
+    "mark_price_fee_rate_cap": "0",
+    "maker_fee_rate": "0.0001",
+    "taker_fee_rate": "0.0003",
+    "base_fee": "0.01",
+    "base_currency": "ETH",
+    "quote_currency": "USD",
+    "option_details": null,
+    "perp_details": {
+      "index": "ETH-USD",
+      "max_rate_per_hour": "0.004",
+      "min_rate_per_hour": "-0.004",
+      "static_interest_rate": "0.0000125",
+      "aggregate_funding": "1075.666630320492272305",
+      "funding_rate": "0.0000125"
+    },
+    "erc20_details": null,
+    "base_asset_address": "0xAf65752C4643E25C02F693f9D4FE19cF23a095E3",
+    "base_asset_sub_id": "0",
+    "pro_rata_fraction": "0",
+    "fifo_min_allocation": "0",
+    "pro_rata_amount_step": "0.1",
+    "best_ask_amount": "2.661",
+    "best_ask_price": "2723",
+    "best_bid_amount": "0.25",
+    "best_bid_price": "2686",
+    "five_percent_bid_depth": "45.761",
+    "five_percent_ask_depth": "33.2",
+    "option_pricing": null,
+    "index_price": "2571.08",
+    "mark_price": "2571.35837376601875803316943347454071044921875",
+    "timestamp": 1791627177000,
+    "min_price": "2520.95",
+    "max_price": "2622.78",
+    "open_interest": {
+      "PM": [
+        {
+          "current_open_interest": "27.0828",
+          "interest_cap": "250000",
+          "manager_currency": "ETH"
+        }
+      ],
+      "PM2": [
+        {
+          "current_open_interest": "26186.9168",
+          "interest_cap": "250000",
+          "manager_currency": "ETH"
+        }
+      ],
+      "SM": [
+        {
+          "current_open_interest": "3368.7393",
+          "interest_cap": "250000",
+          "manager_currency": null
+        }
+      ]
+    }
+  },
+  "id": "b060ebf7-ad60-4f72-8467-e5b011b07b52"
+}

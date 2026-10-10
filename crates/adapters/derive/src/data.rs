@@ -73,7 +73,7 @@ use crate::{
     common::{
         consts::{
             DERIVE_CANDLES_DEFAULT_LIMIT, DERIVE_CANDLES_MAX_PAGES, DERIVE_TRADES_PAGE_SIZE,
-            DERIVE_VENUE,
+            DERIVE_VENUE, RECONNECT_BACKOFF_FACTOR, RECONNECT_BASE_BACKOFF, RECONNECT_MAX_BACKOFF,
         },
         enums::{
             DeriveInstrumentType, DeriveOrderbookDepth, DeriveOrderbookGroup, DeriveTickerInterval,
@@ -88,7 +88,7 @@ use crate::{
     websocket::client::DeriveWebSocketShutdownHandle,
     websocket::{
         DEFAULT_ORDERBOOK_DEPTH, DEFAULT_ORDERBOOK_GROUP, DEFAULT_TICKER_INTERVAL,
-        DerivePublicWsData, DeriveTickerMsg, DeriveWebSocketClient,
+        DerivePublicWsData, DeriveQuoteHealthHandle, DeriveTickerMsg, DeriveWebSocketClient,
         DeriveWebSocketSubscriptionHandle, DeriveWsError, DeriveWsMessage, QuoteFeedState,
         WsMessageContext, bar_spec_to_derive_period, orderbook_channel, parse_candle_record,
         parse_funding_rate, parse_funding_rate_history_record, parse_index_price, parse_mark_price,
@@ -154,7 +154,7 @@ impl DeriveDataClient {
     /// Returns an error when the HTTP client cannot be initialized.
     pub fn new(client_id: ClientId, config: DeriveDataClientConfig) -> anyhow::Result<Self> {
         if config.rest_market_data_failover_enabled {
-            let poll_interval_ms = config
+            let _poll_interval_ms = config
                 .rest_market_data_poll_interval_ms
                 .filter(|interval| *interval > 0)
                 .ok_or_else(|| {
@@ -172,7 +172,6 @@ impl DeriveDataClient {
                 })?;
             u64::try_from(Duration::from_secs(max_quote_age_secs).as_nanos())
                 .context("maximum REST quote age exceeds the supported duration")?;
-            let _ = poll_interval_ms;
         }
 
         let clock = get_atomic_clock_realtime();
@@ -547,7 +546,11 @@ impl DeriveDataClient {
                     {
                         state.ws_subscription_confirmed = true;
                     }
-                    if !state.ws_subscription_confirmed {
+                    // Only the REST-failover path needs to fence a stale
+                    // pre-reconnect confirmation from a genuine current-epoch
+                    // one; with the feature off this must stay byte-for-byte
+                    // the pre-change WS path regardless of ack status.
+                    if ctx.max_quote_age_secs.is_some() && !state.ws_subscription_confirmed {
                         return;
                     }
                     if ctx.max_quote_age_secs.is_some()
@@ -708,6 +711,17 @@ impl DeriveDataClient {
         self.ws_handle.clone()
     }
 
+    /// Returns a cloneable handle for checking per-instrument quote
+    /// freshness from outside this client (e.g. the execution client's
+    /// "missing required quote" entry gate). See [`DeriveQuoteHealthHandle`].
+    // Not yet called outside this file's tests; staged for the execution
+    // client to consume once wired up (see `DeriveQuoteHealthHandle`).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn quote_health_handle(&self) -> DeriveQuoteHealthHandle {
+        DeriveQuoteHealthHandle::new(Arc::clone(&self.quote_feed_state))
+    }
+
     fn subscription_lifecycle(&self) -> SubscriptionLifecycle {
         SubscriptionLifecycle {
             registry: Arc::clone(&self.channel_subscriptions),
@@ -780,7 +794,6 @@ impl DeriveDataClient {
             let subscription_lock = Arc::clone(&self.subscription_lock);
             let sender = self.data_sender.clone();
             let clock = self.clock;
-            let is_connected = Arc::clone(&self.is_connected);
             let cancellation = self.cancellation_token.clone();
             let ws_subscription_handle = ws.clone();
             let poll_interval_ms = self
@@ -804,7 +817,6 @@ impl DeriveDataClient {
                     generation,
                     sender,
                     clock,
-                    is_connected,
                     ws_subscription_handle,
                     cancellation,
                     poll_interval_ms,
@@ -980,28 +992,49 @@ impl DataClient for DeriveDataClient {
             let ws_session_generation = Arc::clone(&self.ws_session_generation);
             let ctx = self.ws_message_context();
             self.spawn_task("derive_websocket_initial_reconnect", async move {
+                let mut retry_delay = RECONNECT_BASE_BACKOFF;
                 loop {
                     tokio::select! {
+                        biased;
                         () = cancellation.cancelled() => return Ok(()),
-                        () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        () = tokio::time::sleep(retry_delay) => {}
                     }
 
                     let mut client = ws_client.lock().await;
                     let connect_result = tokio::select! {
+                        biased;
                         () = cancellation.cancelled() => return Ok(()),
                         result = client.connect() => result,
                     };
                     match connect_result {
                         Ok(()) => {
+                            retry_delay = RECONNECT_BASE_BACKOFF;
                             let Some(mut rx) = client.take_event_receiver() else {
                                 anyhow::bail!("Derive WebSocket event receiver not initialized");
                             };
+                            // A rebuilt transport starts with no subscriptions
+                            // at all (unlike an in-place reconnect, which
+                            // replays them automatically), so this retry
+                            // owner must reissue every channel the data
+                            // client still considers active or WS data never
+                            // resumes for the rest of the process.
+                            let replay_channels = active_channels_for_replay(&ctx);
+                            if !replay_channels.is_empty()
+                                && let Err(e) =
+                                    client.subscribe_channels(replay_channels.clone()).await
+                            {
+                                log::warn!(
+                                    "Failed to replay Derive channel subscriptions after \
+                                     WebSocket reconnect: {e}; channels={replay_channels:?}",
+                                );
+                            }
                             drop(client);
                             is_connected.store(true, Ordering::Release);
                             ws_session_generation.fetch_add(1, Ordering::AcqRel);
 
                             loop {
                                 tokio::select! {
+                                    biased;
                                     () = cancellation.cancelled() => return Ok(()),
                                     maybe_msg = rx.recv() => match maybe_msg {
                                         Some(msg) => {
@@ -1031,6 +1064,7 @@ impl DataClient for DeriveDataClient {
                         Err(e) => {
                             drop(client);
                             log::warn!("Derive WebSocket initial reconnect failed: {e}");
+                            retry_delay = next_reconnect_delay(retry_delay);
                         }
                     }
                 }
@@ -2630,6 +2664,30 @@ fn process_ticker_quote(
     }
 }
 
+/// Returns `true` when the WebSocket subscription for `state` is both
+/// genuinely confirmed under the transport's current identity and recent
+/// enough that the REST poller can skip this instrument.
+///
+/// Shared by the pre-request and post-request decisions in
+/// [`poll_rest_quotes`] so the two can never drift apart: a sustained
+/// upgrade outage (socket down, no successful redial yet) must suppress
+/// polling in neither case, even though a now-stale `confirmed_channels`
+/// entry's transport epoch happens to still match.
+fn ws_quote_is_current(
+    state: &QuoteFeedState,
+    transport_is_active: bool,
+    current_epoch: u64,
+    now: UnixNanos,
+    max_age_nanos: u64,
+) -> bool {
+    transport_is_active
+        && state.ws_subscription_confirmed
+        && state.ws_epoch == Some(current_epoch)
+        && state.last_ws_received.is_some_and(|received| {
+            now.as_u64() >= received.as_u64() && now.as_u64() - received.as_u64() <= max_age_nanos
+        })
+}
+
 #[expect(clippy::too_many_arguments)]
 async fn poll_rest_quotes(
     instrument_id: InstrumentId,
@@ -2642,7 +2700,6 @@ async fn poll_rest_quotes(
     generation: u64,
     sender: EventSender<DataEvent>,
     clock: &'static AtomicTime,
-    is_connected: Arc<AtomicBool>,
     ws_subscription_handle: DeriveWebSocketSubscriptionHandle,
     cancellation: CancellationToken,
     poll_interval_ms: u64,
@@ -2651,6 +2708,8 @@ async fn poll_rest_quotes(
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let max_age_nanos = Duration::from_secs(max_quote_age_secs).as_nanos() as u64;
+    let mut rest_poll_attempts: u64 = 0;
+    let mut has_ever_published = false;
 
     loop {
         tokio::select! {
@@ -2664,19 +2723,30 @@ async fn poll_rest_quotes(
 
         let now = clock.get_time_ns();
         let current_epoch = ws_subscription_handle.connection_epoch();
+        let transport_is_active = ws_subscription_handle.is_active();
         let ws_is_current = quote_feed_state
             .lock()
             .get(&instrument_id)
             .is_some_and(|state| {
-                is_connected.load(Ordering::Acquire)
-                    && state.ws_epoch == Some(current_epoch)
-                    && state.last_ws_received.is_some_and(|received| {
-                        now.as_u64() >= received.as_u64()
-                            && now.as_u64() - received.as_u64() <= max_age_nanos
-                    })
+                ws_quote_is_current(
+                    state,
+                    transport_is_active,
+                    current_epoch,
+                    now,
+                    max_age_nanos,
+                )
             });
         if ws_is_current {
             continue;
+        }
+
+        rest_poll_attempts += 1;
+        if rest_poll_failure_warning_due(rest_poll_attempts, has_ever_published) {
+            log::warn!(
+                "Derive REST market-data polling for {instrument_id} has not produced a single \
+                 quote after {rest_poll_attempts} attempts; the instrument has no fresh quote \
+                 from any source despite the client reporting connected",
+            );
         }
 
         let Some(instrument) = instruments.get_cloned(&instrument_id) else {
@@ -2742,14 +2812,15 @@ async fn poll_rest_quotes(
         let mut feed_states = quote_feed_state.lock();
         let now = clock.get_time_ns();
         let current_epoch = ws_subscription_handle.connection_epoch();
+        let transport_is_active = ws_subscription_handle.is_active();
         let ws_is_current = feed_states.get(&instrument_id).is_some_and(|state| {
-            state.ws_subscription_confirmed
-                && state.ws_epoch == Some(current_epoch)
-                && is_connected.load(Ordering::Acquire)
-                && state.last_ws_received.is_some_and(|received| {
-                    now.as_u64() >= received.as_u64()
-                        && now.as_u64() - received.as_u64() <= max_age_nanos
-                })
+            ws_quote_is_current(
+                state,
+                transport_is_active,
+                current_epoch,
+                now,
+                max_age_nanos,
+            )
         });
         if ws_is_current {
             continue;
@@ -2779,6 +2850,7 @@ async fn poll_rest_quotes(
         };
 
         state.last_published_event = Some(quote.ts_event);
+        has_ever_published = true;
         if !state.rest_polling {
             let age_nanos = ts_init.as_u64().saturating_sub(quote.ts_event.as_u64());
             let poll_latency_ms = poll_started.elapsed().as_millis();
@@ -2933,6 +3005,66 @@ fn trade_channel(instrument: &InstrumentAny) -> anyhow::Result<String> {
     Ok(trades_channel(&instrument_type, currency))
 }
 
+/// How many consecutive REST poll attempts elapse between "this instrument
+/// has never produced a quote" warnings, once polling is actually due (i.e.
+/// excluding attempts the WS-is-current check short-circuits).
+const REST_POLL_FAILURE_WARNING_EVERY: u64 = 20;
+
+/// Returns `true` when a periodic "REST polling has never produced a
+/// quote" warning is due for this attempt count.
+///
+/// A one-way latch: once `has_ever_published` is `true`, the instrument is
+/// no longer in a total-failure state by this definition and the warning
+/// never fires again, even if a later individual poll fails.
+fn rest_poll_failure_warning_due(attempts: u64, has_ever_published: bool) -> bool {
+    !has_ever_published && attempts > 0 && attempts.is_multiple_of(REST_POLL_FAILURE_WARNING_EVERY)
+}
+
+/// Grows `current` by the shared reconnect backoff factor, capped at the
+/// shared maximum — the same growth `execution.rs`'s WebSocket retry loop
+/// uses. A pure function so the retry schedule is unit-testable without
+/// waiting out real sleeps.
+fn next_reconnect_delay(current: Duration) -> Duration {
+    current
+        .mul_f64(RECONNECT_BACKOFF_FACTOR)
+        .min(RECONNECT_MAX_BACKOFF)
+}
+
+/// Rebuilds the channel list a freshly built transport needs resubscribed.
+///
+/// A transport rebuild (full teardown + `connect()`, as opposed to the
+/// generic transport's own in-place reconnect) starts with no subscriptions
+/// at all: `DeriveWebSocketClient::teardown` clears its desired-subscription
+/// set because the venue session ended with the transport. Only an in-place
+/// reconnect replays subscriptions automatically (`recover_session`), so
+/// whoever owns a transport rebuild must re-derive and reissue every
+/// currently active channel from the data client's own subscription registry
+/// or WS data silently stops for the rest of the process.
+fn active_channels_for_replay(ctx: &WsMessageContext) -> Vec<String> {
+    let mut channels: Vec<String> = ctx
+        .active_ticker_channels
+        .load()
+        .values()
+        .cloned()
+        .chain(ctx.active_book_delta_channels.load().values().cloned())
+        .chain(ctx.active_book_depth_channels.load().values().cloned())
+        .collect();
+
+    for instrument_id in ctx.active_trade_subs.load().iter() {
+        let Some(instrument) = ctx.instruments.get_cloned(instrument_id) else {
+            continue;
+        };
+        match trade_channel(&instrument) {
+            Ok(channel) => channels.push(channel),
+            Err(e) => {
+                log::warn!("Cannot rebuild Derive trade channel for {instrument_id}: {e}");
+            }
+        }
+    }
+
+    channels
+}
+
 fn derive_instrument_type(instrument: &InstrumentAny) -> anyhow::Result<DeriveInstrumentType> {
     match instrument {
         InstrumentAny::CryptoPerpetual(_) => Ok(DeriveInstrumentType::Perp),
@@ -3002,6 +3134,59 @@ mod tests {
         let content = std::fs::read_to_string(data_path().join(filename))
             .unwrap_or_else(|_| panic!("failed to read {filename}"));
         serde_json::from_str(&content).expect("invalid json")
+    }
+
+    #[rstest]
+    fn test_next_reconnect_delay_grows_and_caps_at_the_shared_maximum() {
+        // A sustained upgrade outage must not keep dialling at the base
+        // interval forever (≈14k attempts/hour against an already-503ing
+        // venue); it must grow like `execution.rs`'s retry loop and
+        // eventually plateau at the shared cap.
+        let mut delay = RECONNECT_BASE_BACKOFF;
+        let mut delays = vec![delay];
+        for _ in 0..10 {
+            delay = next_reconnect_delay(delay);
+            delays.push(delay);
+        }
+
+        assert!(
+            delays.windows(2).all(|pair| pair[1] >= pair[0]),
+            "delay must never shrink between attempts: {delays:?}",
+        );
+        assert!(
+            delays[1] > RECONNECT_BASE_BACKOFF,
+            "the second attempt must already back off past the base interval",
+        );
+        assert_eq!(
+            *delays.last().unwrap(),
+            RECONNECT_MAX_BACKOFF,
+            "growth must plateau at the shared cap rather than diverging",
+        );
+    }
+
+    #[rstest]
+    fn test_rest_poll_failure_warning_due_fires_periodically_until_first_success() {
+        // Readiness that hides a total REST-polling failure forever is a
+        // production-blind-spot risk; this must fire at a predictable
+        // cadence while nothing has ever published, and never once
+        // something has.
+        let fires: Vec<bool> = (0..=REST_POLL_FAILURE_WARNING_EVERY * 2)
+            .map(|attempts| rest_poll_failure_warning_due(attempts, false))
+            .collect();
+
+        assert!(!fires[0], "attempt 0 (no attempt yet) must not warn");
+        assert!(fires[REST_POLL_FAILURE_WARNING_EVERY as usize]);
+        assert!(fires[(REST_POLL_FAILURE_WARNING_EVERY * 2) as usize]);
+        assert_eq!(
+            fires.iter().filter(|&&due| due).count(),
+            2,
+            "must fire exactly on multiples of the interval: {fires:?}",
+        );
+
+        assert!(
+            !rest_poll_failure_warning_due(REST_POLL_FAILURE_WARNING_EVERY, true),
+            "must never fire once a quote has ever been published",
+        );
     }
 
     #[rstest]
@@ -3208,6 +3393,46 @@ mod tests {
     }
 
     #[rstest]
+    fn test_handle_ticker_delivers_quote_without_confirmation_when_failover_disabled() {
+        // REST failover off (`max_quote_age_secs: None`, `make_ctx`'s
+        // default) must behave byte-for-byte like the pre-change WS path:
+        // an ack that never confirmed the channel (an unusual venue status,
+        // a server that doesn't track confirmations) must still deliver
+        // quotes rather than being silently dropped by the failover-only
+        // confirmation fence.
+        let instrument = perp_instrument();
+        let instrument_id = instrument.id();
+        let (ctx, mut rx) = make_ctx(Some(instrument));
+        // Override `make_ctx`'s pre-seeded `ws_subscription_confirmed: true`
+        // to simulate a channel the handle never actually confirmed.
+        ctx.quote_feed_state
+            .lock()
+            .get_mut(&instrument_id)
+            .unwrap()
+            .ws_subscription_confirmed = false;
+        ctx.active_ticker_channels
+            .insert(instrument_id, "ticker_slim.ETH-PERP.1000".to_string());
+        ctx.active_quote_subs.insert(instrument_id);
+        let payload = subscription_payload(
+            "ticker_slim.ETH-PERP.1000",
+            &json!({
+                "timestamp": 1_700_000_000_010_i64,
+                "instrument_ticker": ticker_json(1_700_000_000_000)
+            }),
+        );
+
+        DeriveDataClient::handle_ws_message(DeriveWsMessage::Subscription(payload), &ctx);
+
+        match rx.try_recv().unwrap() {
+            DataEvent::Data(Data::Quote(quote)) => assert_eq!(quote.instrument_id, instrument_id),
+            other => panic!(
+                "expected quote data event even without a confirmed WS subscription, \
+                 was {other:?}"
+            ),
+        }
+    }
+
+    #[rstest]
     fn test_handle_ticker_partial_quote_without_cache_emits_no_quote() {
         let instrument = spot_instrument();
         let instrument_id = instrument.id();
@@ -3306,6 +3531,44 @@ mod tests {
         assert!(!client.is_connected());
 
         client.cancellation_token.cancel();
+    }
+
+    #[rstest]
+    fn test_quote_health_handle_reports_last_published_event() {
+        // Lets another client (e.g. execution) check per-instrument quote
+        // freshness without depending on `is_connected()`, which can report
+        // `true` throughout a REST-failover outage even if no quote has
+        // ever actually been published for a given instrument.
+        let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        replace_data_event_sender(data_tx);
+        let config = DeriveDataClientConfig {
+            environment: DeriveEnvironment::Mainnet,
+            ..Default::default()
+        };
+        let client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
+        let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+        let handle = client.quote_health_handle();
+
+        assert_eq!(
+            handle.last_quote_event(instrument_id),
+            None,
+            "no quote has been published yet",
+        );
+
+        let published_at = UnixNanos::from(1_700_000_000_000_000_000);
+        client
+            .quote_feed_state
+            .lock()
+            .entry(instrument_id)
+            .or_default()
+            .last_published_event = Some(published_at);
+
+        assert_eq!(handle.last_quote_event(instrument_id), Some(published_at));
+        assert_eq!(
+            handle.last_quote_event(InstrumentId::from("BTC-PERP.DERIVE")),
+            None,
+            "an instrument with no recorded quote must stay None",
+        );
     }
 
     #[rstest]

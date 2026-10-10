@@ -691,6 +691,27 @@ async fn test_get_ticker_uses_instrument_specific_endpoint(
     }
 }
 
+/// Decodes a verbatim `public/get_ticker` response captured from the legacy v2
+/// base (`api.lyra.finance`) on 2026-10-10, not derived from the bulk fixtures.
+#[rstest]
+#[tokio::test]
+async fn test_get_ticker_decodes_captured_legacy_v2_response() {
+    let state = TestServerState::with_success_response();
+    *state.response_body.lock().await = load_json("perps/http_get_ticker_eth_perp_v2_capture.json");
+    let addr = start_mock_server(state.clone()).await;
+
+    let client = DeriveHttpClient::new(base_url(addr), Some(5), None, None).unwrap();
+    let ticker = client.get_ticker_for_instrument("ETH-PERP").await.unwrap();
+
+    assert_eq!(ticker.instrument_name, "ETH-PERP");
+    assert_eq!(ticker.best_bid_price.to_string(), "2686");
+    assert_eq!(ticker.best_ask_price.to_string(), "2723");
+    assert_eq!(ticker.best_bid_amount.to_string(), "0.25");
+    assert_eq!(ticker.best_ask_amount.to_string(), "2.661");
+    assert_eq!(ticker.timestamp, 1_791_627_177_000);
+    assert!(ticker.option_pricing.is_none());
+}
+
 #[rstest]
 #[case::option(
     "ETH-20260627-3500-C",

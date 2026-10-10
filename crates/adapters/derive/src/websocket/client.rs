@@ -142,6 +142,21 @@ const SUBSCRIPTION_ACCEPTED_STATUSES: &[&str] = &["ok"];
 const SUBSCRIPTION_REPLAY_ACCEPTED_STATUSES: &[&str] = &["ok", "already subscribed"];
 pub(super) const UNAUTHENTICATED_CONNECTION_EPOCH: u64 = u64::MAX;
 
+/// Identity of a subscription confirmation: the transport generation it was
+/// confirmed under, paired with that transport's own low-level connection
+/// epoch at the time.
+///
+/// The generation is bumped once per rebuilt transport and never reset, so
+/// two distinct transport instances can never compare equal even though each
+/// one's own epoch independently restarts at zero. Without the generation, a
+/// confirmation recorded under a torn-down transport's epoch zero would
+/// wrongly match a freshly rebuilt transport that also starts at epoch zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionEpoch {
+    generation: u64,
+    epoch: u64,
+}
+
 /// WebSocket client for the Derive JSON-RPC stream.
 ///
 /// Construct with [`Self::new`] (public-only) or [`Self::with_credentials`]
@@ -154,6 +169,12 @@ pub struct DeriveWebSocketClient {
     proxy_url: Option<SecretString>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     connection_epoch: Arc<ArcSwap<AtomicU64>>,
+    /// Monotonic count of transports this client has built. Bumped once per
+    /// successful `connect()` that installs a new transport; never reset by
+    /// `teardown()`, so it is a lifecycle identity that cannot collide
+    /// across rebuilt transports the way the per-transport epoch can (see
+    /// [`SessionEpoch`]).
+    transport_generation: Arc<AtomicU64>,
     signal: Arc<AtomicBool>,
     auth_tracker: AuthTracker,
     authenticated_epoch: Arc<AtomicU64>,
@@ -162,12 +183,14 @@ pub struct DeriveWebSocketClient {
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>>,
     subscriptions: Arc<DashMap<String, ()>>,
-    /// Channel -> connection epoch at which a `subscribe` acknowledgement
+    /// Channel -> session epoch at which a `subscribe` acknowledgement
     /// (initial or post-reconnect replay) was last actually confirmed by the
     /// venue. Separate from `subscriptions`, which only tracks desired
     /// channels and survives a reconnect unchanged, so it cannot by itself
-    /// distinguish a current-epoch acknowledgement from a stale one.
-    confirmed_channels: Arc<DashMap<String, u64>>,
+    /// distinguish a current-epoch acknowledgement from a stale one. Cleared
+    /// on `teardown()` so no entry can outlive the transport it was
+    /// confirmed under.
+    confirmed_channels: Arc<DashMap<String, SessionEpoch>>,
     subscription_lock: Arc<tokio::sync::Mutex<()>>,
     task_handle: TaskSlot<()>,
     send_task: Arc<SharedTaskSlot<()>>,
@@ -220,7 +243,7 @@ impl Drop for DeriveWebSocketSetupGuard {
 pub struct DeriveWebSocketSubscriptionHandle {
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     subscriptions: Arc<DashMap<String, ()>>,
-    confirmed_channels: Arc<DashMap<String, u64>>,
+    confirmed_channels: Arc<DashMap<String, SessionEpoch>>,
     subscription_lock: Arc<tokio::sync::Mutex<()>>,
     request_timeout: Duration,
     rate_limiter: Arc<WsRateLimiter>,
@@ -229,6 +252,15 @@ pub struct DeriveWebSocketSubscriptionHandle {
     /// recovery runs). Distinct from `subscriptions`, which tracks desired
     /// channels across reconnects and is not itself epoch-aware.
     connection_epoch: Arc<ArcSwap<AtomicU64>>,
+    /// Mirrors [`DeriveWebSocketClient::transport_generation`]; see
+    /// [`SessionEpoch`] for why both are needed together.
+    transport_generation: Arc<AtomicU64>,
+    /// The generic transport's own connection mode, so callers can observe
+    /// actual socket health (e.g. mid-reconnect-storm, with no successful
+    /// redial yet) rather than inferring it from a higher-level "recovery
+    /// confirmed" flag that only updates once a reconnect attempt either
+    /// succeeds or exhausts its retry budget.
+    connection_mode: Arc<ArcSwap<AtomicU8>>,
 }
 
 /// Cloneable handle for issuing signed `private/*` trading requests over the
@@ -327,6 +359,7 @@ impl DeriveWebSocketClient {
             proxy_url: proxy_url.map(SecretString::from),
             connection_mode,
             connection_epoch,
+            transport_generation: Arc::new(AtomicU64::new(0)),
             signal: Arc::new(AtomicBool::new(false)),
             auth_tracker: AuthTracker::new(),
             authenticated_epoch: Arc::new(AtomicU64::new(UNAUTHENTICATED_CONNECTION_EPOCH)),
@@ -464,6 +497,10 @@ impl DeriveWebSocketClient {
         let reconnect_handle = client.reconnect_handle();
         self.connection_mode.store(Arc::clone(&connection_mode));
         self.connection_epoch.store(Arc::clone(&connection_epoch));
+        // A brand-new transport's own epoch restarts at zero just like the
+        // torn-down one's did, so fence confirmations with a generation that
+        // only ever increases across the client's whole lifetime.
+        let generation = self.transport_generation.fetch_add(1, Ordering::AcqRel) + 1;
         log::debug!("Derive WebSocket connected: {}", self.url);
 
         if let Err(e) = cmd_tx.send(HandlerCommand::SetClient(client)) {
@@ -520,6 +557,7 @@ impl DeriveWebSocketClient {
                             recovery_credentials.as_ref(),
                             &recovery_subscriptions,
                             &recovery_confirmed_channels,
+                            generation,
                             &recovery_subscription_lock,
                             request_timeout,
                         )
@@ -717,6 +755,11 @@ impl DeriveWebSocketClient {
         self.authenticated_epoch
             .store(UNAUTHENTICATED_CONNECTION_EPOCH, Ordering::Release);
         self.subscriptions.clear();
+        // The torn-down transport's confirmations can never apply to
+        // whatever transport connect() builds next; drop them outright
+        // rather than relying solely on the generation fence in
+        // `SessionEpoch` to make a stale entry unreachable.
+        self.confirmed_channels.clear();
         self.signal.store(false, Ordering::Relaxed);
 
         if let Some(control) = &self.socket_control {
@@ -893,6 +936,8 @@ impl DeriveWebSocketClient {
             request_timeout: self.request_timeout,
             rate_limiter: Arc::clone(&self.rate_limiter),
             connection_epoch: Arc::clone(&self.connection_epoch),
+            transport_generation: Arc::clone(&self.transport_generation),
+            connection_mode: Arc::clone(&self.connection_mode),
         }
     }
 
@@ -953,15 +998,36 @@ impl DeriveWebSocketSubscriptionHandle {
         self.connection_epoch.load().load(Ordering::Acquire)
     }
 
+    /// Returns `true` while the underlying transport is in the active
+    /// state, mirroring [`DeriveWebSocketClient::is_active`]. Unlike a
+    /// higher-level "recovery confirmed" flag, this reflects the socket's
+    /// actual current state even mid-reconnect-storm, before any redial has
+    /// succeeded or the retry budget has been exhausted.
+    pub(crate) fn is_active(&self) -> bool {
+        self.connection_mode.load().load(Ordering::Relaxed) == ConnectionMode::Active as u8
+    }
+
+    /// Returns the current transport generation (see [`SessionEpoch`]).
+    fn transport_generation(&self) -> u64 {
+        self.transport_generation.load(Ordering::Acquire)
+    }
+
+    fn current_session_epoch(&self) -> SessionEpoch {
+        SessionEpoch {
+            generation: self.transport_generation(),
+            epoch: self.connection_epoch(),
+        }
+    }
+
     /// Returns `true` when `channel` was last acknowledged by the venue
     /// (initial subscribe, or post-reconnect replay) under the *current*
-    /// connection epoch. `false` both when the channel has never been
-    /// acknowledged and when its last acknowledgement predates a
-    /// since-happened reconnect.
+    /// transport generation and connection epoch. `false` both when the
+    /// channel has never been acknowledged and when its last acknowledgement
+    /// predates a since-happened reconnect or transport rebuild.
     pub(crate) fn channel_confirmed_for_current_epoch(&self, channel: &str) -> bool {
         self.confirmed_channels
             .get(channel)
-            .is_some_and(|epoch| *epoch == self.connection_epoch())
+            .is_some_and(|session_epoch| *session_epoch == self.current_session_epoch())
     }
 
     pub(crate) fn forget_subscription(&self, channel: &str) {
@@ -1140,7 +1206,7 @@ impl DeriveWebSocketSubscriptionHandle {
         if confirmed.iter().any(|topic| topic == &channel) {
             self.subscriptions.insert(channel.clone(), ());
             self.confirmed_channels
-                .insert(channel, self.connection_epoch());
+                .insert(channel, self.current_session_epoch());
         }
         failure.map_or(Ok(()), Err)
     }
@@ -1863,7 +1929,8 @@ async fn recover_session(
     connection_epoch: &AtomicU64,
     creds: Option<&DeriveWsCredentials>,
     subscriptions: &DashMap<String, ()>,
-    confirmed_channels: &DashMap<String, u64>,
+    confirmed_channels: &DashMap<String, SessionEpoch>,
+    generation: u64,
     subscription_lock: &tokio::sync::Mutex<()>,
     timeout: Duration,
 ) -> Result<u64> {
@@ -1892,6 +1959,7 @@ async fn recover_session(
                 cmd_tx,
                 channels,
                 confirmed_channels,
+                generation,
                 timeout,
                 expected_epoch,
             )
@@ -2010,7 +2078,8 @@ async fn subscribe_via_handler(
     rate_limiter: &WsRateLimiter,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
     channels: Vec<String>,
-    confirmed_channels: &DashMap<String, u64>,
+    confirmed_channels: &DashMap<String, SessionEpoch>,
+    generation: u64,
     timeout: Duration,
     connection_epoch: u64,
 ) -> Result<()> {
@@ -2041,7 +2110,13 @@ async fn subscribe_via_handler(
     // confirmation from a genuine current-epoch one (see
     // `DeriveWebSocketSubscriptionHandle::channel_confirmed_for_current_epoch`).
     for channel in confirmed {
-        confirmed_channels.insert(channel, connection_epoch);
+        confirmed_channels.insert(
+            channel,
+            SessionEpoch {
+                generation,
+                epoch: connection_epoch,
+            },
+        );
     }
     failure.map_or(Ok(()), Err)
 }

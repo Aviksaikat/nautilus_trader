@@ -125,6 +125,44 @@ use crate::{
 
 const DERIVE_PRIVATE_PAGE_SIZE: u32 = 500;
 
+/// Refusal reason when fallback private state is missing, stale, incomplete,
+/// not yet applied, or holds an unresolved write.
+const REST_GATE_PRIVATE_STATE: &str =
+    "Derive REST fallback is waiting for fresh, fully reconciled private state";
+
+/// Refusal reason when no sufficiently fresh quote backs a risk-increasing
+/// write.
+const REST_GATE_QUOTE: &str =
+    "Derive REST fallback has no sufficiently fresh quote for this instrument";
+
+/// Refusal reason when the targeted order's own write outcome is unknown.
+const REST_GATE_UNRESOLVED_ORDER: &str =
+    "Derive REST fallback cannot act on this order while its write outcome is unresolved";
+
+/// Consecutive settled, complete reconciliations that must each find no trace
+/// of an ambiguous write before its absence is accepted as evidence that the
+/// write never reached the venue.
+const REST_ABSENCE_OBSERVATIONS_REQUIRED: u32 = 2;
+
+/// Whether every row a reconciliation needed was converted.
+///
+/// The reused report APIs are deliberately best-effort: they log and omit a row
+/// they cannot convert, and keep that behaviour for every other caller. A REST
+/// admission decision may not read an omission as a complete picture, so the
+/// counts travel alongside the reports.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReportCompleteness {
+    skipped_orders: usize,
+    skipped_fills: usize,
+    skipped_positions: usize,
+}
+
+impl ReportCompleteness {
+    const fn is_complete(self) -> bool {
+        self.skipped_orders == 0 && self.skipped_fills == 0 && self.skipped_positions == 0
+    }
+}
+
 /// Live execution client for Derive.
 ///
 /// Owns the HTTP and WebSocket clients used to talk to the venue plus an
@@ -374,6 +412,8 @@ impl DeriveExecutionClient {
             dispatch_state: Arc::clone(&self.dispatch_state),
             rest_execution_state: Arc::clone(&self.rest_execution_state),
             is_connected: Arc::clone(&self.is_connected),
+            private_state_poll_interval_secs: self.config.private_state_poll_interval_secs,
+            max_account_state_age_secs: self.config.max_account_state_age_secs,
         }
     }
 
@@ -401,7 +441,12 @@ impl DeriveExecutionClient {
                     () = cancellation.cancelled() => break,
                     _ = ticker.tick() => {
                         if !ws_exec.is_authenticated() {
-                            rest_execution_state.active.store(true, Ordering::Release);
+                            set_rest_fallback_active(
+                                &rest_execution_state,
+                                true,
+                                "websocket_unauthenticated",
+                                context.clock.get_time_ns().as_u64(),
+                            );
                             rest_execution_state.websocket_ready.store(false, Ordering::Release);
                         }
                         if rest_execution_state.active.load(Ordering::Acquire)
@@ -415,7 +460,12 @@ impl DeriveExecutionClient {
                             && rest_execution_state.websocket_ready.load(Ordering::Acquire)
                             && rest_execution_state.unresolved_orders.lock().is_empty()
                         {
-                            rest_execution_state.active.store(false, Ordering::Release);
+                            set_rest_fallback_active(
+                                &rest_execution_state,
+                                false,
+                                "websocket_ready_and_all_writes_resolved",
+                                context.clock.get_time_ns().as_u64(),
+                            );
                         }
                     }
                 }
@@ -430,23 +480,17 @@ impl DeriveExecutionClient {
                 || !self.ws_exec.is_authenticated())
     }
 
-    fn rest_entry_gate_open(&self) -> bool {
-        let Some(max_age_secs) = self.config.max_account_state_age_secs else {
-            return false;
-        };
-        let last_reconciliation_ns = self
-            .rest_execution_state
-            .last_private_reconciliation_ns
-            .load(Ordering::Acquire);
+    /// Synchronous pre-check for a risk-increasing fallback write, so an order
+    /// that cannot be admitted is denied before `OrderSubmitted` is emitted.
+    /// [`reserve_rest_write`] re-applies the same predicate atomically with the
+    /// write itself.
+    fn rest_entry_gate_open(&self, quote_ts_event: Option<UnixNanos>) -> bool {
         let now_ns = self.clock.get_time_ns().as_u64();
-        let max_age_ns = max_age_secs.saturating_mul(1_000_000_000);
+        let max_age_secs = self.config.max_account_state_age_secs;
 
-        last_reconciliation_ns > 0
-            && now_ns.saturating_sub(last_reconciliation_ns) <= max_age_ns
-            && !self
-                .rest_execution_state
-                .reconciliation_failed
-                .load(Ordering::Acquire)
+        self.reconciliation_reports_applied()
+            && private_state_is_fresh(&self.rest_execution_state, now_ns, max_age_secs)
+            && quote_is_fresh(quote_ts_event, now_ns, max_age_secs)
             && self
                 .rest_execution_state
                 .unresolved_orders
@@ -454,8 +498,51 @@ impl DeriveExecutionClient {
                 .is_empty()
     }
 
+    /// Returns whether the engine has applied the last complete
+    /// reconciliation's order reports: no order the venue reported closed is
+    /// still open in the cache.
+    ///
+    /// The cache is not `Send`, so this runs on the command thread and latches
+    /// the result for the reservation that follows inside the spawned task. A
+    /// reconciliation that is never applied goes stale on its own, so this can
+    /// delay the gate opening but never hold it open.
+    fn reconciliation_reports_applied(&self) -> bool {
+        if self
+            .rest_execution_state
+            .reports_applied
+            .load(Ordering::Acquire)
+        {
+            return true;
+        }
+        let reported = self.rest_execution_state.reported_order_closed.lock();
+        let cache = self.core.cache();
+        let applied = reported.iter().all(|(client_order_id, venue_closed)| {
+            !*venue_closed
+                || cache
+                    .order(client_order_id)
+                    .is_none_or(|order| order.is_closed())
+        });
+        drop(cache);
+        drop(reported);
+        if applied {
+            self.rest_execution_state
+                .reports_applied
+                .store(true, Ordering::Release);
+        }
+        applied
+    }
+
+    /// Event time of the newest cached quote for `instrument_id`, captured on
+    /// the command thread because the cache is not `Send`.
+    fn cached_quote_ts_event(&self, instrument_id: &InstrumentId) -> Option<UnixNanos> {
+        self.core.cache().quote(instrument_id).map(|q| q.ts_event)
+    }
+
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
-        self.reconciliation_context().refresh_account_state().await
+        self.reconciliation_context()
+            .refresh_account_state()
+            .await?;
+        Ok(())
     }
 
     /// Blocks until the account appears in the cache, or `timeout_secs` elapses.
@@ -624,8 +711,41 @@ impl DeriveExecutionClient {
                     .store(true, Ordering::Release);
                 if let Err(e) = context.recover_after_reconnect().await {
                     log::warn!("Derive startup recovery after WebSocket retry failed: {e:?}");
+                    // Keep dialling: stopping here would leave the client in
+                    // permanent REST mode while presenting itself as connected.
+                    let _ = ws_client.lock().await.disconnect().await;
+                    context
+                        .rest_execution_state
+                        .websocket_ready
+                        .store(false, Ordering::Release);
+                    retry_delay = retry_delay
+                        .mul_f64(RECONNECT_BACKOFF_FACTOR)
+                        .min(RECONNECT_MAX_BACKOFF);
+                    continue;
                 }
-                break;
+
+                // This task owns redialling for the whole session. Park until
+                // the dispatcher reports an unrecoverable session failure
+                // (`websocket_ready` cleared while fallback is active), then
+                // dial again rather than exiting and stranding the client in
+                // REST mode.
+                retry_delay = RECONNECT_BASE_BACKOFF;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return,
+                        () = tokio::time::sleep(RECONNECT_BASE_BACKOFF) => {}
+                    }
+                    let state = &context.rest_execution_state;
+                    if state.active.load(Ordering::Acquire)
+                        && !state.websocket_ready.load(Ordering::Acquire)
+                    {
+                        log::warn!(
+                            "Derive execution WebSocket session failed after recovery; redialling"
+                        );
+                        break;
+                    }
+                }
             }
         })?;
         Ok(())
@@ -654,10 +774,12 @@ fn spawn_ws_dispatch(
                 maybe = rx.recv() => {
                     match maybe {
                         Some(DeriveWsMessage::Reconnected) => {
-                            reconciliation
-                                .rest_execution_state
-                                .active
-                                .store(true, Ordering::Release);
+                            set_rest_fallback_active(
+                                &reconciliation.rest_execution_state,
+                                true,
+                                "websocket_reconnected_pending_reconciliation",
+                                clock.get_time_ns().as_u64(),
+                            );
                             reconciliation
                                 .rest_execution_state
                                 .websocket_ready
@@ -679,10 +801,12 @@ fn spawn_ws_dispatch(
                             }
                         }
                         Some(DeriveWsMessage::SessionRecoveryFailed(reason)) => {
-                            reconciliation
-                                .rest_execution_state
-                                .active
-                                .store(true, Ordering::Release);
+                            set_rest_fallback_active(
+                                &reconciliation.rest_execution_state,
+                                true,
+                                "websocket_session_recovery_failed",
+                                clock.get_time_ns().as_u64(),
+                            );
                             reconciliation
                                 .rest_execution_state
                                 .websocket_ready
@@ -833,17 +957,73 @@ impl ExecutionClient for DeriveExecutionClient {
             DeriveWsChannel::private_trades(self.credential.subaccount_id()),
             DeriveWsChannel::balances(self.credential.subaccount_id()),
         ];
-        let ws_connect_result = { self.ws_client.lock().await.connect().await };
-        if let Err(e) = ws_connect_result {
-            if !self.config.rest_fallback_enabled || !matches!(e, DeriveWsError::Transport(_)) {
-                self.teardown_partial_connect().await?;
-                return Err(anyhow::Error::new(e).context("failed to connect Derive WebSocket"));
-            }
+        // The design's startup trigger is "disconnected **or**
+        // unauthenticated", so both a failed upgrade and a session that comes
+        // up but cannot authenticate its private subscriptions enter REST
+        // fallback rather than hard-failing startup. A genuinely bad credential
+        // still fails, because the initial REST reconciliation signs with the
+        // same key.
+        let mut fallback_reason: Option<String> = None;
+        let mut event_receiver = None;
 
-            log::warn!("Derive WebSocket is unavailable at startup; entering REST fallback: {e}");
-            self.rest_execution_state
-                .active
-                .store(true, Ordering::Release);
+        let ws_connect_result = self.ws_client.lock().await.connect().await;
+        match ws_connect_result {
+            Err(e) => {
+                if !self.config.rest_fallback_enabled {
+                    self.teardown_partial_connect().await?;
+                    return Err(anyhow::Error::new(e).context("failed to connect Derive WebSocket"));
+                }
+                fallback_reason = Some(format!("WebSocket connect failed: {e}"));
+            }
+            Ok(()) => {
+                let Some(rx) = self.ws_client.lock().await.take_event_receiver() else {
+                    let e = anyhow::anyhow!("Derive execution WS event receiver not initialized");
+                    if let Err(teardown_error) = self.teardown_partial_connect().await {
+                        return Err(e.context(format!(
+                            "Derive execution startup teardown failed: {teardown_error}"
+                        )));
+                    }
+                    return Err(e);
+                };
+                event_receiver = Some(rx);
+
+                let subscribe_result = {
+                    self.ws_client
+                        .lock()
+                        .await
+                        .subscribe_channels(channels.clone())
+                        .await
+                };
+                if let Err(e) = subscribe_result {
+                    if !self.config.rest_fallback_enabled {
+                        log::warn!("Derive private WS subscriptions failed: {e}; tearing down");
+                        if let Err(teardown_error) = self.teardown_partial_connect().await {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "Derive execution startup teardown failed: {teardown_error}"
+                            )));
+                        }
+                        return Err(
+                            anyhow::Error::new(e).context("failed Derive private WS subscriptions")
+                        );
+                    }
+                    fallback_reason = Some(format!("WebSocket private subscriptions failed: {e}"));
+                }
+            }
+        }
+
+        if let Some(reason) = fallback_reason {
+            log::warn!("Derive WebSocket is unusable at startup; entering REST fallback: {reason}");
+            // Drop any half-open session so the retry task dials from scratch.
+            drop(event_receiver);
+            if let Err(e) = self.ws_client.lock().await.disconnect().await {
+                log::warn!("Failed to reset Derive WebSocket before REST fallback startup: {e}");
+            }
+            set_rest_fallback_active(
+                &self.rest_execution_state,
+                true,
+                "websocket_unusable_at_startup",
+                self.clock.get_time_ns().as_u64(),
+            );
             self.reconciliation_context()
                 .reconcile_private_state()
                 .await
@@ -866,8 +1046,8 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(());
         }
 
-        let Some(rx) = self.ws_client.lock().await.take_event_receiver() else {
-            let e = anyhow::anyhow!("Derive execution WS event receiver not initialized");
+        let Some(rx) = event_receiver else {
+            let e = anyhow::anyhow!("Derive execution WS event receiver was consumed");
             if let Err(teardown_error) = self.teardown_partial_connect().await {
                 return Err(e.context(format!(
                     "Derive execution startup teardown failed: {teardown_error}"
@@ -875,23 +1055,6 @@ impl ExecutionClient for DeriveExecutionClient {
             }
             return Err(e);
         };
-
-        let subscribe_result = {
-            self.ws_client
-                .lock()
-                .await
-                .subscribe_channels(channels)
-                .await
-        };
-        if let Err(e) = subscribe_result {
-            log::warn!("Derive private WS subscriptions failed: {e}; tearing down");
-            if let Err(teardown_error) = self.teardown_partial_connect().await {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "Derive execution startup teardown failed: {teardown_error}"
-                )));
-            }
-            return Err(anyhow::Error::new(e).context("failed Derive private WS subscriptions"));
-        }
 
         if let Err(e) = self.start_ws_dispatch(rx) {
             if let Err(teardown_error) = self.teardown_partial_connect().await {
@@ -943,9 +1106,16 @@ impl ExecutionClient for DeriveExecutionClient {
                 .unresolved_orders
                 .lock()
                 .is_empty();
-        self.rest_execution_state
-            .active
-            .store(recovery_pending, Ordering::Release);
+        set_rest_fallback_active(
+            &self.rest_execution_state,
+            recovery_pending,
+            if recovery_pending {
+                "startup_recovery_pending"
+            } else {
+                "websocket_connected"
+            },
+            self.clock.get_time_ns().as_u64(),
+        );
         self.rest_execution_state
             .websocket_ready
             .store(true, Ordering::Release);
@@ -1065,11 +1235,30 @@ impl ExecutionClient for DeriveExecutionClient {
         }
 
         let use_rest_fallback = self.should_use_rest_fallback();
+        // Reduce-only submits cannot increase exposure (the venue refuses them
+        // when they would), so unrelated account-wide uncertainty must not
+        // block the de-risking lever this failover exists to preserve.
+        let write_kind = if order.is_reduce_only() {
+            RestWriteKind::ReducingSubmit
+        } else {
+            RestWriteKind::RiskIncreasingSubmit
+        };
+        let cached_quote_ts_event = self.cached_quote_ts_event(&cmd.instrument_id);
         if use_rest_fallback {
             let reason = if is_trigger_order {
                 Some("Derive trigger order submission is unsupported during REST fallback")
-            } else if !self.rest_entry_gate_open() {
-                Some("Derive REST fallback is waiting for fresh, fully reconciled private state")
+            } else if write_kind.is_risk_increasing()
+                && !self.rest_entry_gate_open(cached_quote_ts_event)
+            {
+                log_rest_write_halted(
+                    &self.rest_execution_state,
+                    order.client_order_id(),
+                    write_kind,
+                    REST_GATE_PRIVATE_STATE,
+                    cached_quote_ts_event,
+                    self.clock.get_time_ns().as_u64(),
+                );
+                Some(REST_GATE_PRIVATE_STATE)
             } else {
                 None
             };
@@ -1146,6 +1335,12 @@ impl ExecutionClient for DeriveExecutionClient {
         let dispatch_state = self.dispatch_state.clone();
         let rest_http_client = http_client.clone();
         let max_account_state_age_secs = self.config.max_account_state_age_secs;
+        let rest_fallback_enabled = self.config.rest_fallback_enabled;
+        // The quote age bound belongs to the fallback feature, so the
+        // default-off WebSocket-only path keeps its existing behaviour.
+        let quote_max_age_secs = rest_fallback_enabled
+            .then_some(max_account_state_age_secs)
+            .flatten();
 
         self.spawn_task("submit_order", async move {
             let instrument = match cached_or_fetch_instrument(
@@ -1189,16 +1384,21 @@ impl ExecutionClient for DeriveExecutionClient {
             }
 
             // Avoid signing against a quote captured before instrument resolution
+            let mut refreshed_quote_ts_event = None;
             let explicit_price = if market_quote.is_some() {
                 let quote = match refresh_market_order_quote(
                     &http_client,
                     &venue_symbol,
                     &instrument,
                     clock,
+                    quote_max_age_secs,
                 )
                 .await
                 {
-                    Ok(quote) => quote,
+                    Ok(quote) => {
+                        refreshed_quote_ts_event = Some(quote.ts_event);
+                        quote
+                    }
                     Err(e) => {
                         let reason = format!(
                             "market-order quote refresh failed for {}: {e}",
@@ -1369,11 +1569,17 @@ impl ExecutionClient for DeriveExecutionClient {
                     payload.order.trigger_type,
                 );
 
+                let Some(reservation) = matching_reservation else {
+                    let reason =
+                        "Derive trigger-order submit lost its matching-engine reservation";
+                    log::warn!("{reason} for {}", order_for_task.client_order_id());
+                    dispatch_state.forget(&order_for_task.client_order_id());
+                    let ts = clock.get_time_ns();
+                    emitter.emit_order_rejected(&order_for_task, reason, ts, false);
+                    return Ok(());
+                };
                 match ws_exec
-                    .submit_trigger_order_after_rate_limit(
-                        &payload,
-                        matching_reservation.expect("trigger orders use WebSocket mode"),
-                    )
+                    .submit_trigger_order_after_rate_limit(&payload, reservation)
                     .await
                 {
                     Ok(order) => {
@@ -1403,6 +1609,15 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Derive trigger submit for {} returned ambiguous WS outcome: {e}; awaiting reconciliation",
                             order_for_task.client_order_id(),
                         );
+                        if rest_fallback_enabled {
+                            record_unresolved_ws_write(
+                                &rest_execution_state,
+                                order_for_task.client_order_id(),
+                                None,
+                                write_kind,
+                                clock.get_time_ns().as_u64(),
+                            );
+                        }
                     }
                     Err(e) => {
                         let (reason, due_post_only) = ws_rejection_reason(&e);
@@ -1495,18 +1710,32 @@ impl ExecutionClient for DeriveExecutionClient {
             );
 
             if use_rest_fallback {
-                if !reserve_rest_entry(
+                let now_ns = clock.get_time_ns().as_u64();
+                let quote_ts_event = refreshed_quote_ts_event.or(cached_quote_ts_event);
+                let operation_id = match reserve_rest_write(
                     &rest_execution_state,
                     order_for_task.client_order_id(),
-                    clock.get_time_ns().as_u64(),
+                    None,
+                    write_kind,
+                    quote_ts_event,
+                    now_ns,
                     max_account_state_age_secs,
-                    false,
                 ) {
-                    let reason = "Derive REST fallback is waiting for fresh, fully reconciled private state";
-                    dispatch_state.forget(&order_for_task.client_order_id());
-                    emitter.emit_order_rejected(&order_for_task, reason, clock.get_time_ns(), false);
-                    return Ok(());
-                }
+                    Ok(operation_id) => operation_id,
+                    Err(reason) => {
+                        log_rest_write_halted(
+                            &rest_execution_state,
+                            order_for_task.client_order_id(),
+                            write_kind,
+                            reason,
+                            quote_ts_event,
+                            now_ns,
+                        );
+                        dispatch_state.forget(&order_for_task.client_order_id());
+                        emitter.emit_order_rejected(&order_for_task, reason, clock.get_time_ns(), false);
+                        return Ok(());
+                    }
+                };
                 match rest_http_client.submit_order(&payload).await {
                     Ok(submitted_order) => {
                         let venue_order_id = VenueOrderId::new(submitted_order.order_id.as_str());
@@ -1514,10 +1743,11 @@ impl ExecutionClient for DeriveExecutionClient {
                             order_for_task.client_order_id(),
                             venue_order_id,
                         );
-                        rest_execution_state
-                            .unresolved_orders
-                            .lock()
-                            .remove(&order_for_task.client_order_id());
+                        resolve_rest_write(
+                            &rest_execution_state,
+                            &order_for_task.client_order_id(),
+                            operation_id,
+                        );
                         let ts_now = clock.get_time_ns();
                         ensure_accepted_emitted(
                             &emitter,
@@ -1537,10 +1767,11 @@ impl ExecutionClient for DeriveExecutionClient {
                         );
                     }
                     Err(e) => {
-                        rest_execution_state
-                            .unresolved_orders
-                            .lock()
-                            .remove(&order_for_task.client_order_id());
+                        resolve_rest_write(
+                            &rest_execution_state,
+                            &order_for_task.client_order_id(),
+                            operation_id,
+                        );
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
                         emitter.emit_order_rejected(
@@ -1556,13 +1787,15 @@ impl ExecutionClient for DeriveExecutionClient {
 
             // Discard the result (and any `trades` it carries): fills arrive on
             // the `.trades` channel and are deduped by trade id.
-            match ws_exec
-                .submit_order_after_rate_limit(
-                    &payload,
-                    matching_reservation.expect("WS submit reserves matching quota"),
-                )
-                .await
-            {
+            let Some(reservation) = matching_reservation else {
+                let reason = "Derive WebSocket submit lost its matching-engine reservation";
+                log::warn!("{reason} for {}", order_for_task.client_order_id());
+                dispatch_state.forget(&order_for_task.client_order_id());
+                let ts = clock.get_time_ns();
+                emitter.emit_order_rejected(&order_for_task, reason, ts, false);
+                return Ok(());
+            };
+            match ws_exec.submit_order_after_rate_limit(&payload, reservation).await {
                 Ok(_) => {
                     log::debug!(
                         "Order submitted: client_order_id={}",
@@ -1575,6 +1808,19 @@ impl ExecutionClient for DeriveExecutionClient {
                         "Derive submit for {} returned ambiguous WS outcome: {e}; awaiting reconciliation",
                         order_for_task.client_order_id(),
                     );
+                    // The transport died after the routing decision was taken,
+                    // so the next command will be routed through REST: record
+                    // the uncertainty or that command would pass the entry gate
+                    // while a possibly-live WebSocket order exists.
+                    if rest_fallback_enabled {
+                        record_unresolved_ws_write(
+                            &rest_execution_state,
+                            order_for_task.client_order_id(),
+                            None,
+                            write_kind,
+                            clock.get_time_ns().as_u64(),
+                        );
+                    }
                 }
                 Err(e) => {
                     let (reason, due_post_only) = ws_rejection_reason(&e);
@@ -1634,6 +1880,7 @@ impl ExecutionClient for DeriveExecutionClient {
             .order(&client_order_id)
             .is_some_and(|order| !order.is_closed() && order.venue_order_id() == venue_order_id);
 
+        let mut cancel_operation_id = 0_u64;
         if use_rest_fallback {
             let reason = if is_trigger_order {
                 Some("Derive trigger-order cancellation is unsupported during REST fallback")
@@ -1643,17 +1890,25 @@ impl ExecutionClient for DeriveExecutionClient {
                 Some(
                     "Derive REST cancellation requires a currently open order with matching venue state",
                 )
-            } else if self
-                .rest_execution_state
-                .unresolved_orders
-                .lock()
-                .contains_key(&client_order_id)
-            {
-                Some(
-                    "Derive REST cancellation cannot proceed while this order outcome is unresolved",
-                )
             } else {
-                None
+                // Cancellation is exposure-reducing, so it needs only this
+                // order's own outcome to be resolved; it is deliberately not
+                // gated on account-wide freshness.
+                match reserve_rest_write(
+                    &self.rest_execution_state,
+                    client_order_id,
+                    venue_order_id,
+                    RestWriteKind::Cancel,
+                    None,
+                    self.clock.get_time_ns().as_u64(),
+                    self.config.max_account_state_age_secs,
+                ) {
+                    Ok(operation_id) => {
+                        cancel_operation_id = operation_id;
+                        None
+                    }
+                    Err(reason) => Some(reason),
+                }
             };
             if let Some(reason) = reason {
                 self.emitter.emit_order_cancel_rejected_event(
@@ -1666,16 +1921,30 @@ impl ExecutionClient for DeriveExecutionClient {
                 );
                 return Ok(());
             }
-            self.rest_execution_state
-                .unresolved_orders
-                .lock()
-                .insert(client_order_id, true);
         }
         let rest_execution_state = Arc::clone(&self.rest_execution_state);
+        let rest_fallback_enabled = self.config.rest_fallback_enabled;
 
         self.spawn_task("cancel_order", async move {
             if use_rest_fallback {
-                let resolved_venue_order_id = venue_order_id.expect("validated above");
+                let Some(resolved_venue_order_id) = venue_order_id else {
+                    let reason = "Derive REST cancellation requires a resolved venue_order_id";
+                    log::warn!("Cannot cancel {client_order_id}: {reason}");
+                    resolve_rest_write(
+                        &rest_execution_state,
+                        &client_order_id,
+                        cancel_operation_id,
+                    );
+                    emitter.emit_order_cancel_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        None,
+                        reason,
+                        clock.get_time_ns(),
+                    );
+                    return Ok(());
+                };
                 match http_client
                     .cancel_order(&DeriveCancelParams::new(
                         subaccount_id,
@@ -1684,17 +1953,26 @@ impl ExecutionClient for DeriveExecutionClient {
                     ))
                     .await
                 {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // The venue confirmed the cancellation, so this write's
+                        // outcome is known and must not keep the gate closed.
+                        resolve_rest_write(
+                            &rest_execution_state,
+                            &client_order_id,
+                            cancel_operation_id,
+                        );
+                    }
                     Err(e) if e.is_ambiguous_write_outcome() => {
                         log::warn!(
                             "Derive REST cancel for {client_order_id} returned ambiguous outcome: {e}; awaiting reconciliation",
                         );
                     }
                     Err(e) => {
-                        rest_execution_state
-                            .unresolved_orders
-                            .lock()
-                            .remove(&client_order_id);
+                        resolve_rest_write(
+                            &rest_execution_state,
+                            &client_order_id,
+                            cancel_operation_id,
+                        );
                         emitter.emit_order_cancel_rejected_event(
                             strategy_id,
                             instrument_id,
@@ -1830,6 +2108,15 @@ impl ExecutionClient for DeriveExecutionClient {
                     log::warn!(
                         "Derive cancel for {client_order_id} returned ambiguous WS outcome: {e}; awaiting reconciliation",
                     );
+                    if rest_fallback_enabled {
+                        record_unresolved_ws_write(
+                            &rest_execution_state,
+                            client_order_id,
+                            venue_order_id,
+                            RestWriteKind::Cancel,
+                            clock.get_time_ns().as_u64(),
+                        );
+                    }
                 }
                 Err(e) => {
                     let (reason, _) = ws_rejection_reason(&e);
@@ -2012,11 +2299,26 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(());
         }
 
+        let target_quantity = cmd.quantity.unwrap_or_else(|| order.quantity());
+        let target_price = cmd.price.or_else(|| order.price());
+        let write_kind = replace_write_kind(&order, target_quantity, target_price);
+        let cached_quote_ts_event = self.cached_quote_ts_event(&cmd.instrument_id);
+
         if use_rest_fallback {
             let reason = if order.venue_order_id() != Some(venue_order_id) {
                 Some("Derive REST replace requires the current resolved venue_order_id")
-            } else if !self.rest_entry_gate_open() {
-                Some("Derive REST fallback is waiting for fresh, fully reconciled private state")
+            } else if write_kind.is_risk_increasing()
+                && !self.rest_entry_gate_open(cached_quote_ts_event)
+            {
+                log_rest_write_halted(
+                    &self.rest_execution_state,
+                    cmd.client_order_id,
+                    write_kind,
+                    REST_GATE_PRIVATE_STATE,
+                    cached_quote_ts_event,
+                    self.clock.get_time_ns().as_u64(),
+                );
+                Some(REST_GATE_PRIVATE_STATE)
             } else {
                 None
             };
@@ -2032,9 +2334,6 @@ impl ExecutionClient for DeriveExecutionClient {
                 return Ok(());
             }
         }
-
-        let target_quantity = cmd.quantity.unwrap_or_else(|| order.quantity());
-        let target_price = cmd.price.or_else(|| order.price());
 
         let venue_symbol = format_venue_symbol(&cmd.instrument_id)?.to_string();
         let http_client = self.http_client.clone();
@@ -2056,6 +2355,7 @@ impl ExecutionClient for DeriveExecutionClient {
         let voi_str = venue_order_id.to_string();
         let rest_execution_state = Arc::clone(&self.rest_execution_state);
         let max_account_state_age_secs = self.config.max_account_state_age_secs;
+        let rest_fallback_enabled = self.config.rest_fallback_enabled;
 
         self.spawn_task("modify_order", async move {
             let instrument = match cached_or_fetch_instrument(
@@ -2171,26 +2471,40 @@ impl ExecutionClient for DeriveExecutionClient {
                 }
             };
 
-            if use_rest_fallback
-                && !reserve_rest_entry(
+            let mut replace_operation_id = 0_u64;
+            if use_rest_fallback {
+                let now_ns = clock.get_time_ns().as_u64();
+                match reserve_rest_write(
                     &rest_execution_state,
                     client_order_id,
-                    clock.get_time_ns().as_u64(),
-                    max_account_state_age_secs,
-                    true,
-                )
-            {
-                let reason = "Derive REST fallback is waiting for fresh, fully reconciled private state";
-                let ts = clock.get_time_ns();
-                emitter.emit_order_modify_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
                     Some(stale_venue_order_id),
-                    reason,
-                    ts,
-                );
-                return Ok(());
+                    write_kind,
+                    cached_quote_ts_event,
+                    now_ns,
+                    max_account_state_age_secs,
+                ) {
+                    Ok(operation_id) => replace_operation_id = operation_id,
+                    Err(reason) => {
+                        log_rest_write_halted(
+                            &rest_execution_state,
+                            client_order_id,
+                            write_kind,
+                            reason,
+                            cached_quote_ts_event,
+                            now_ns,
+                        );
+                        let ts = clock.get_time_ns();
+                        emitter.emit_order_modify_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            Some(stale_venue_order_id),
+                            reason,
+                            ts,
+                        );
+                        return Ok(());
+                    }
+                }
             }
 
             // Mark before sending so the cancel-of-old leg is suppressed even if
@@ -2206,11 +2520,22 @@ impl ExecutionClient for DeriveExecutionClient {
                     }
                 }
             } else {
+                let Some(reservation) = matching_reservation else {
+                    let reason = "Derive WebSocket replace lost its matching-engine reservation";
+                    log::warn!("{reason} for {client_order_id}");
+                    let ts = clock.get_time_ns();
+                    emitter.emit_order_modify_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        reason,
+                        ts,
+                    );
+                    return Ok(());
+                };
                 match ws_exec
-                    .modify_order_after_rate_limit(
-                        &payload,
-                        matching_reservation.expect("WS replace reserves matching quota"),
-                    )
+                    .modify_order_after_rate_limit(&payload, reservation)
                     .await
                 {
                     Ok(outcome) => (Ok(outcome), false),
@@ -2227,6 +2552,15 @@ impl ExecutionClient for DeriveExecutionClient {
                 log::warn!(
                     "Derive modify for {client_order_id} returned ambiguous outcome; awaiting reconciliation",
                 );
+                if !use_rest_fallback && rest_fallback_enabled {
+                    record_unresolved_ws_write(
+                        &rest_execution_state,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        write_kind,
+                        clock.get_time_ns().as_u64(),
+                    );
+                }
                 return Ok(());
             }
 
@@ -2243,10 +2577,11 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Skipping private/replace response event for {client_order_id}: an incoming terminal frame already resolved the modify",
                         );
                         if use_rest_fallback {
-                            rest_execution_state
-                                .unresolved_orders
-                                .lock()
-                                .remove(&client_order_id);
+                            resolve_rest_write(
+                                &rest_execution_state,
+                                &client_order_id,
+                                replace_operation_id,
+                            );
                         }
                         return Ok(());
                     }
@@ -2254,7 +2589,11 @@ impl ExecutionClient for DeriveExecutionClient {
                         "Order replaced: client_order_id={client_order_id}, new venue_order_id={new_voi}",
                     );
                     let ts = clock.get_time_ns();
-                    rest_execution_state.unresolved_orders.lock().remove(&client_order_id);
+                    resolve_rest_write(
+                        &rest_execution_state,
+                        &client_order_id,
+                        replace_operation_id,
+                    );
                     emitter.emit_order_updated(
                         &order_for_task,
                         new_voi,
@@ -2278,10 +2617,11 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Skipping partial private/replace response for {client_order_id}: an incoming terminal frame already resolved the modify",
                         );
                         if use_rest_fallback {
-                            rest_execution_state
-                                .unresolved_orders
-                                .lock()
-                                .remove(&client_order_id);
+                            resolve_rest_write(
+                                &rest_execution_state,
+                                &client_order_id,
+                                replace_operation_id,
+                            );
                         }
                         return Ok(());
                     }
@@ -2309,7 +2649,11 @@ impl ExecutionClient for DeriveExecutionClient {
                         ts,
                         ts,
                     );
-                    rest_execution_state.unresolved_orders.lock().remove(&client_order_id);
+                    resolve_rest_write(
+                        &rest_execution_state,
+                        &client_order_id,
+                        replace_operation_id,
+                    );
                     dispatch_state.forget(&client_order_id);
                 }
                 Err(e) => {
@@ -2325,7 +2669,11 @@ impl ExecutionClient for DeriveExecutionClient {
                     }
                     let reason = e;
                     if use_rest_fallback {
-                        rest_execution_state.unresolved_orders.lock().remove(&client_order_id);
+                        resolve_rest_write(
+                            &rest_execution_state,
+                            &client_order_id,
+                            replace_operation_id,
+                        );
                     }
                     log::debug!("Derive rejected modify for {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
@@ -2401,37 +2749,263 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 }
 
+/// What a write was trying to do. This decides both the evidence that can
+/// resolve an ambiguous outcome and whether the write is risk-increasing (and
+/// therefore subject to the full entry gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestWriteKind {
+    /// A new order that may increase exposure.
+    RiskIncreasingSubmit,
+    /// A new reduce-only order. The venue refuses it if it would increase
+    /// exposure, so unrelated account-wide uncertainty must not block it.
+    ReducingSubmit,
+    /// Cancellation of a known venue order.
+    Cancel,
+    /// A replace that raises quantity or moves the limit price toward the
+    /// market.
+    RiskIncreasingReplace,
+    /// A replace that cannot increase exposure.
+    ReducingReplace,
+}
+
+impl RestWriteKind {
+    /// Risk-increasing writes require fresh, applied private state, a fresh
+    /// per-instrument quote, and no unresolved write anywhere on the account.
+    /// Exposure-reducing writes require only that the order they act on has no
+    /// unresolved write of its own.
+    const fn is_risk_increasing(self) -> bool {
+        matches!(
+            self,
+            Self::RiskIncreasingSubmit | Self::RiskIncreasingReplace
+        )
+    }
+
+    /// Name used in halt/transition logs.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RiskIncreasingSubmit => "risk_increasing_submit",
+            Self::ReducingSubmit => "reducing_submit",
+            Self::Cancel => "cancel",
+            Self::RiskIncreasingReplace => "risk_increasing_replace",
+            Self::ReducingReplace => "reducing_replace",
+        }
+    }
+}
+
+/// A write whose venue outcome is unknown.
+///
+/// The write is never retried. It is resolved only by positive evidence about
+/// the operation itself, or by its absence across
+/// [`REST_ABSENCE_OBSERVATIONS_REQUIRED`] complete reconciliations that each
+/// started at least one settle window after the write (and after one another),
+/// which is what keeps a write that never reached the venue from wedging the
+/// entry gate and WebSocket recovery for the process lifetime.
+#[derive(Debug, Clone, Copy)]
+struct UnresolvedWrite {
+    /// Monotonic write id, so only the write that recorded an entry can retire
+    /// it. Without it, a stale response could clear a newer operation.
+    operation_id: u64,
+    kind: RestWriteKind,
+    /// The venue order this write acted on. `None` for a submit, whose venue
+    /// order id is only learned from a definitive response.
+    venue_order_id: Option<VenueOrderId>,
+    /// Reconciliations started when the write was recorded. A reconciliation
+    /// whose snapshots predate the write carries no evidence about it.
+    recorded_at_reconciliation: u64,
+    /// Clock time the write was recorded, for the settle window.
+    recorded_ns: u64,
+    /// Settled complete reconciliations that found no trace of this operation.
+    absent_observations: u32,
+    /// Start time of the last counted absence observation, so two polls inside
+    /// one settle window cannot both count.
+    last_absent_observation_ns: u64,
+}
+
 #[derive(Debug, Default)]
 struct RestExecutionState {
     active: AtomicBool,
     websocket_ready: AtomicBool,
     reconciliation_failed: AtomicBool,
+    /// Clock time the oldest snapshot of the last complete reconciliation was
+    /// *observed* (the account request start), never the time its long history
+    /// traversal finished.
     last_private_reconciliation_ns: AtomicU64,
-    unresolved_orders: Mutex<AHashMap<ClientOrderId, bool>>,
+    /// Whether the engine has applied the last reconciliation's order reports.
+    /// Reports are applied asynchronously, so entries admitted before that
+    /// would be sized against pre-reconciliation state.
+    reports_applied: AtomicBool,
+    /// Reconciliations started so far. An ambiguous write records the current
+    /// value so evidence gathered earlier cannot resolve it.
+    reconciliations_started: AtomicU64,
+    /// Monotonic source for [`UnresolvedWrite::operation_id`].
+    next_operation_id: AtomicU64,
+    unresolved_orders: Mutex<AHashMap<ClientOrderId, UnresolvedWrite>>,
+    /// Closed-ness the last complete reconciliation reported per client order
+    /// id, used to decide whether the engine has applied it yet.
+    reported_order_closed: Mutex<AHashMap<ClientOrderId, bool>>,
 }
 
-fn reserve_rest_entry(
+/// Private-state health required by every risk-increasing write: a complete
+/// reconciliation, observed within the configured maximum age, already applied
+/// by the engine.
+fn private_state_is_fresh(
     state: &RestExecutionState,
-    client_order_id: ClientOrderId,
     now_ns: u64,
     max_age_secs: Option<u64>,
-    requires_terminal: bool,
 ) -> bool {
     let Some(max_age_secs) = max_age_secs else {
         return false;
     };
-    let mut unresolved = state.unresolved_orders.lock();
-    let last_reconciliation_ns = state.last_private_reconciliation_ns.load(Ordering::Acquire);
-    let max_age_ns = max_age_secs.saturating_mul(1_000_000_000);
-    if last_reconciliation_ns == 0
-        || now_ns.saturating_sub(last_reconciliation_ns) > max_age_ns
-        || state.reconciliation_failed.load(Ordering::Acquire)
-        || !unresolved.is_empty()
-    {
+    let observed_ns = state.last_private_reconciliation_ns.load(Ordering::Acquire);
+    observed_ns > 0
+        && now_ns.saturating_sub(observed_ns) <= max_age_secs.saturating_mul(1_000_000_000)
+        && !state.reconciliation_failed.load(Ordering::Acquire)
+        && state.reports_applied.load(Ordering::Acquire)
+}
+
+/// Quote freshness required before a risk-increasing write.
+///
+/// Derive's execution config carries a single freshness bound
+/// (`max_account_state_age_secs`); private state and quotes are both measured
+/// against it, so an operator sets one maximum staleness for every input an
+/// entry decision depends on. A missing or future-dated quote denies the write.
+fn quote_is_fresh(ts_event: Option<UnixNanos>, now_ns: u64, max_age_secs: Option<u64>) -> bool {
+    let (Some(ts_event), Some(max_age_secs)) = (ts_event, max_age_secs) else {
         return false;
+    };
+    let ts_event = ts_event.as_u64();
+    ts_event <= now_ns
+        && now_ns.saturating_sub(ts_event) <= max_age_secs.saturating_mul(1_000_000_000)
+}
+
+/// Final admission gate for a fallback write, immediately before it is sent.
+///
+/// On success the write is recorded as unresolved, so a lost or ambiguous
+/// response can never be mistaken for a rejection; the returned operation id
+/// retires that record once the outcome is definitive.
+fn reserve_rest_write(
+    state: &RestExecutionState,
+    client_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    kind: RestWriteKind,
+    quote_ts_event: Option<UnixNanos>,
+    now_ns: u64,
+    max_age_secs: Option<u64>,
+) -> Result<u64, &'static str> {
+    let mut unresolved = state.unresolved_orders.lock();
+
+    if kind.is_risk_increasing() {
+        if !private_state_is_fresh(state, now_ns, max_age_secs) || !unresolved.is_empty() {
+            return Err(REST_GATE_PRIVATE_STATE);
+        }
+        if !quote_is_fresh(quote_ts_event, now_ns, max_age_secs) {
+            return Err(REST_GATE_QUOTE);
+        }
+    } else if unresolved.contains_key(&client_order_id) {
+        return Err(REST_GATE_UNRESOLVED_ORDER);
     }
-    unresolved.insert(client_order_id, requires_terminal);
-    true
+
+    let operation_id = state.next_operation_id.fetch_add(1, Ordering::AcqRel);
+    unresolved.insert(
+        client_order_id,
+        UnresolvedWrite {
+            operation_id,
+            kind,
+            venue_order_id,
+            recorded_at_reconciliation: state.reconciliations_started.load(Ordering::Acquire),
+            recorded_ns: now_ns,
+            absent_observations: 0,
+            last_absent_observation_ns: 0,
+        },
+    );
+    Ok(operation_id)
+}
+
+/// Records a write whose outcome became unknown without passing through
+/// [`reserve_rest_write`] — a WebSocket write whose transport died after the
+/// routing decision was taken. Without this, the next command would be routed
+/// through REST and pass the entry gate while a possibly-live WebSocket order
+/// exists.
+fn record_unresolved_ws_write(
+    state: &RestExecutionState,
+    client_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    kind: RestWriteKind,
+    now_ns: u64,
+) {
+    let operation_id = state.next_operation_id.fetch_add(1, Ordering::AcqRel);
+    let recorded_at_reconciliation = state.reconciliations_started.load(Ordering::Acquire);
+    state.unresolved_orders.lock().insert(
+        client_order_id,
+        UnresolvedWrite {
+            operation_id,
+            kind,
+            venue_order_id,
+            recorded_at_reconciliation,
+            recorded_ns: now_ns,
+            absent_observations: 0,
+            last_absent_observation_ns: 0,
+        },
+    );
+    log::warn!(
+        "Derive {} for {client_order_id} returned an ambiguous WebSocket outcome; holding risk-increasing writes until reconciliation resolves it",
+        kind.as_str(),
+    );
+}
+
+/// Retires an unresolved write after a definitive outcome. Only the write that
+/// recorded the entry can retire it.
+fn resolve_rest_write(
+    state: &RestExecutionState,
+    client_order_id: &ClientOrderId,
+    operation_id: u64,
+) {
+    let mut unresolved = state.unresolved_orders.lock();
+    if unresolved
+        .get(client_order_id)
+        .is_some_and(|write| write.operation_id == operation_id)
+    {
+        unresolved.remove(client_order_id);
+    }
+}
+
+/// Flips REST fallback activity, logging the transition once with the reason
+/// and the age of the private state the decision was taken against.
+///
+/// Must not be called while `unresolved_orders` is locked.
+fn set_rest_fallback_active(state: &RestExecutionState, active: bool, reason: &str, now_ns: u64) {
+    if state.active.swap(active, Ordering::AcqRel) == active {
+        return;
+    }
+    let observed_ns = state.last_private_reconciliation_ns.load(Ordering::Acquire);
+    let private_state_age_ns = (observed_ns > 0).then(|| now_ns.saturating_sub(observed_ns));
+    log::info!(
+        "Derive execution mode changed to {} (reason={reason}, private_state_age_ns={private_state_age_ns:?}, unresolved_writes={})",
+        if active { "rest_polling" } else { "websocket" },
+        state.unresolved_orders.lock().len(),
+    );
+}
+
+/// Logs a refused risk-increasing write as a `halted` transition so a wedged
+/// gate is visible in production rather than silent.
+fn log_rest_write_halted(
+    state: &RestExecutionState,
+    client_order_id: ClientOrderId,
+    kind: RestWriteKind,
+    reason: &str,
+    quote_ts_event: Option<UnixNanos>,
+    now_ns: u64,
+) {
+    let observed_ns = state.last_private_reconciliation_ns.load(Ordering::Acquire);
+    let private_state_age_ns = (observed_ns > 0).then(|| now_ns.saturating_sub(observed_ns));
+    let quote_age_ns = quote_ts_event.map(|ts| now_ns.saturating_sub(ts.as_u64()));
+    log::warn!(
+        "Derive execution halted for {client_order_id} (state=halted, operation={}, reason={reason}, private_state_age_ns={private_state_age_ns:?}, quote_age_ns={quote_age_ns:?}, reconciliation_failed={}, reports_applied={}, unresolved_writes={})",
+        kind.as_str(),
+        state.reconciliation_failed.load(Ordering::Acquire),
+        state.reports_applied.load(Ordering::Acquire),
+        state.unresolved_orders.lock().len(),
+    );
 }
 
 #[derive(Clone)]
@@ -2445,10 +3019,21 @@ struct DeriveReconciliationContext {
     dispatch_state: Arc<WsDispatchState>,
     rest_execution_state: Arc<RestExecutionState>,
     is_connected: Arc<AtomicBool>,
+    private_state_poll_interval_secs: Option<u64>,
+    max_account_state_age_secs: Option<u64>,
 }
 
 impl DeriveReconciliationContext {
-    async fn refresh_account_state(&self) -> anyhow::Result<()> {
+    /// Fetches and publishes the subaccount snapshot, returning the time the
+    /// snapshot was *observed*.
+    ///
+    /// The observation time is the request start, which is the conservative
+    /// bound: the venue's view is at least that old by the time the response
+    /// lands. Callers use it as the age of the account state, so a long history
+    /// traversal afterwards can never make an already-expired snapshot look
+    /// fresh.
+    async fn refresh_account_state(&self) -> anyhow::Result<UnixNanos> {
+        let observed_at = self.clock.get_time_ns();
         let value = self
             .http_client
             .get_subaccount(&DeriveGetSubaccountParams::new(self.subaccount_id))
@@ -2459,7 +3044,7 @@ impl DeriveReconciliationContext {
         let ts_event = self.clock.get_time_ns();
         self.emitter
             .emit_account_state(balances, margins, true, ts_event, Some(info));
-        Ok(())
+        Ok(observed_at)
     }
 
     async fn recover_after_reconnect(&self) -> anyhow::Result<()> {
@@ -2468,6 +3053,13 @@ impl DeriveReconciliationContext {
                 .reconciliation_failed
                 .store(true, Ordering::Release);
             return Err(e);
+        }
+        if self
+            .rest_execution_state
+            .reconciliation_failed
+            .load(Ordering::Acquire)
+        {
+            anyhow::bail!("Derive REST recovery reconciliation was incomplete");
         }
         if !self
             .rest_execution_state
@@ -2478,44 +3070,193 @@ impl DeriveReconciliationContext {
             anyhow::bail!("Derive REST recovery still has unresolved order outcomes");
         }
         self.is_connected.store(true, Ordering::Release);
-        self.rest_execution_state
-            .active
-            .store(false, Ordering::Release);
+        set_rest_fallback_active(
+            &self.rest_execution_state,
+            false,
+            "post_reconnect_reconciliation_complete",
+            self.clock.get_time_ns().as_u64(),
+        );
         Ok(())
     }
 
+    /// A write's effect must be visible in the venue's own read APIs before its
+    /// absence is evidence that it never landed.
+    ///
+    /// The window is one full reconciliation cadence plus one full
+    /// account-state freshness bound, so it scales with whatever the operator
+    /// configured and hard-codes no production cadence. `None` when either
+    /// bound is unset, which disables absence-based resolution entirely.
+    fn absence_settle_window_ns(&self) -> Option<u64> {
+        let poll_interval_secs = self.private_state_poll_interval_secs?;
+        let max_age_secs = self.max_account_state_age_secs?;
+        Some(
+            poll_interval_secs
+                .saturating_add(max_age_secs)
+                .saturating_mul(1_000_000_000),
+        )
+    }
+
     async fn reconcile_private_state(&self) -> anyhow::Result<()> {
-        self.refresh_account_state().await?;
-        let mass_status = Box::pin(self.generate_mass_status(None)).await?;
+        let reconciliation_index = self
+            .rest_execution_state
+            .reconciliations_started
+            .fetch_add(1, Ordering::AcqRel);
+        let account_observed_at = self.refresh_account_state().await?;
+        let (mass_status, completeness) =
+            Box::pin(self.generate_mass_status_with_completeness(None)).await?;
         let order_count = mass_status.order_reports().len();
         let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
         let position_count = mass_status.position_reports().len();
-        {
-            let mut unresolved = self.rest_execution_state.unresolved_orders.lock();
-            for (_, report) in mass_status.order_reports() {
-                if let Some(client_order_id) = report.client_order_id
-                    && unresolved
-                        .get(&client_order_id)
-                        .is_some_and(|requires_terminal| {
-                            !requires_terminal || report.order_status.is_closed()
-                        })
-                {
-                    unresolved.remove(&client_order_id);
-                }
-            }
+
+        if !completeness.is_complete() {
+            // The reports still go to the engine (they are the best available
+            // view), but an incomplete picture may not open the entry gate: a
+            // dropped fill or position would otherwise release an ambiguous
+            // order or hide exposure.
+            self.emitter
+                .send_execution_report(ExecutionReport::MassStatus(Box::new(mass_status)));
+            self.rest_execution_state
+                .reconciliation_failed
+                .store(true, Ordering::Release);
+            self.rest_execution_state
+                .reports_applied
+                .store(false, Ordering::Release);
+            log::warn!(
+                "Derive private reconciliation incomplete (state=halted, skipped_orders={}, skipped_fills={}, skipped_positions={}); risk-increasing writes stay blocked",
+                completeness.skipped_orders,
+                completeness.skipped_fills,
+                completeness.skipped_positions,
+            );
+            return Ok(());
         }
+
+        self.resolve_unresolved_writes(&mass_status, reconciliation_index, account_observed_at);
+        self.record_reported_order_states(&mass_status);
+        self.rest_execution_state
+            .reports_applied
+            .store(false, Ordering::Release);
         self.emitter
             .send_execution_report(ExecutionReport::MassStatus(Box::new(mass_status)));
         self.rest_execution_state
             .last_private_reconciliation_ns
-            .store(self.clock.get_time_ns().as_u64(), Ordering::Release);
+            .store(account_observed_at.as_u64(), Ordering::Release);
         self.rest_execution_state
             .reconciliation_failed
             .store(false, Ordering::Release);
         log::info!(
-            "Derive private reconciliation submitted: orders={order_count}, fills={fill_count}, positions={position_count}",
+            "Derive private reconciliation submitted (state=reconciling, orders={order_count}, fills={fill_count}, positions={position_count}, account_snapshot_age_ns={})",
+            self.clock
+                .get_time_ns()
+                .as_u64()
+                .saturating_sub(account_observed_at.as_u64()),
         );
         Ok(())
+    }
+
+    /// Records the closed-ness the venue reported per client order id, so the
+    /// entry gate can tell whether the engine has applied this reconciliation.
+    fn record_reported_order_states(&self, mass_status: &ExecutionMassStatus) {
+        let mut reported = self.rest_execution_state.reported_order_closed.lock();
+        reported.clear();
+        for (_, report) in mass_status.order_reports() {
+            if let Some(client_order_id) = report.client_order_id {
+                // A label is only treated as closed when every report for it
+                // is, so an open current leg is not masked by a closed
+                // historical replacement leg.
+                let closed = report.order_status.is_closed();
+                reported
+                    .entry(client_order_id)
+                    .and_modify(|existing| *existing = *existing && closed)
+                    .or_insert(closed);
+            }
+        }
+    }
+
+    /// Applies one complete reconciliation's evidence to the unresolved writes.
+    ///
+    /// Resolution is deliberately narrow. A cancel or replace is resolved only
+    /// by a terminal report for the exact venue order it targeted, so a
+    /// terminal report for an older replacement leg sharing the same client
+    /// label cannot release the current leg. A submit is resolved by any report
+    /// carrying its client order id. Anything else must wait for the absence
+    /// rule, which needs [`REST_ABSENCE_OBSERVATIONS_REQUIRED`] settled,
+    /// separated observations before it accepts that the write never landed.
+    fn resolve_unresolved_writes(
+        &self,
+        mass_status: &ExecutionMassStatus,
+        reconciliation_index: u64,
+        started_at: UnixNanos,
+    ) {
+        let mut unresolved = self.rest_execution_state.unresolved_orders.lock();
+        if unresolved.is_empty() {
+            return;
+        }
+
+        let mut closed_by_venue_order_id: AHashMap<VenueOrderId, bool> =
+            AHashMap::with_capacity(mass_status.order_reports().len());
+        let mut reported_client_order_ids: AHashSet<ClientOrderId> = AHashSet::new();
+        for (_, report) in mass_status.order_reports() {
+            let closed = report.order_status.is_closed();
+            closed_by_venue_order_id
+                .entry(report.venue_order_id)
+                .and_modify(|existing| *existing = *existing || closed)
+                .or_insert(closed);
+            if let Some(client_order_id) = report.client_order_id {
+                reported_client_order_ids.insert(client_order_id);
+            }
+        }
+
+        let started_ns = started_at.as_u64();
+        let settle_window_ns = self.absence_settle_window_ns();
+
+        unresolved.retain(|client_order_id, write| {
+            if write.recorded_at_reconciliation >= reconciliation_index {
+                // These snapshots were requested before the write; they say
+                // nothing about it.
+                return true;
+            }
+
+            let resolved_by_evidence = match write.venue_order_id {
+                Some(venue_order_id) => {
+                    closed_by_venue_order_id.get(&venue_order_id) == Some(&true)
+                }
+                None => reported_client_order_ids.contains(client_order_id),
+            };
+            if resolved_by_evidence {
+                log::info!(
+                    "Derive {} for {client_order_id} resolved by reconciliation evidence",
+                    write.kind.as_str(),
+                );
+                return false;
+            }
+
+            let Some(settle_window_ns) = settle_window_ns else {
+                return true;
+            };
+            if started_ns < write.recorded_ns.saturating_add(settle_window_ns) {
+                return true;
+            }
+            if write.last_absent_observation_ns != 0
+                && started_ns
+                    < write
+                        .last_absent_observation_ns
+                        .saturating_add(settle_window_ns)
+            {
+                return true;
+            }
+
+            write.last_absent_observation_ns = started_ns;
+            write.absent_observations = write.absent_observations.saturating_add(1);
+            if write.absent_observations < REST_ABSENCE_OBSERVATIONS_REQUIRED {
+                return true;
+            }
+            log::warn!(
+                "Derive {} for {client_order_id} resolved as never placed: absent from {} consecutive settled reconciliations",
+                write.kind.as_str(),
+                write.absent_observations,
+            );
+            false
+        });
     }
 
     async fn generate_order_status_report(
@@ -2657,11 +3398,28 @@ impl DeriveReconciliationContext {
         Ok(Some(report))
     }
 
+    /// Best-effort order status reports, as every other caller expects.
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
         normalize_history_client_order_ids: bool,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let (reports, _) = self
+            .generate_order_status_reports_with_completeness(
+                cmd,
+                normalize_history_client_order_ids,
+            )
+            .await?;
+        Ok(reports)
+    }
+
+    /// As [`Self::generate_order_status_reports`], also returning how many rows
+    /// the venue sent that could not be converted.
+    async fn generate_order_status_reports_with_completeness(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+        normalize_history_client_order_ids: bool,
+    ) -> anyhow::Result<(Vec<OrderStatusReport>, usize)> {
         let instrument_name = cmd.instrument_id.map(|id| id.symbol.as_str().to_string());
         let orders: Vec<DeriveOrder> = if cmd.open_only {
             let mut orders = self
@@ -2724,6 +3482,7 @@ impl DeriveReconciliationContext {
         };
 
         let mut reports = Vec::with_capacity(orders.len());
+        let mut skipped = 0_usize;
 
         for order in orders {
             let (price_precision, size_precision) =
@@ -2743,18 +3502,33 @@ impl DeriveReconciliationContext {
                     }
                     reports.push(report);
                 }
-                Err(e) => log::warn!("Skipping order in status report: {e}"),
+                Err(e) => {
+                    skipped += 1;
+                    log::warn!("Skipping order in status report: {e}");
+                }
             }
         }
 
         retain_order_status_reports(&mut reports, cmd);
-        Ok(reports)
+        Ok((reports, skipped))
     }
 
+    /// Best-effort fill reports, as every other caller expects.
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
+        let (reports, _) = self.generate_fill_reports_with_completeness(cmd).await?;
+        Ok(reports)
+    }
+
+    /// As [`Self::generate_fill_reports`], also returning how many trade rows
+    /// could not be converted. Pending settlements and already-applied trades
+    /// are deliberate skips and are not counted.
+    async fn generate_fill_reports_with_completeness(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<(Vec<FillReport>, usize)> {
         let instrument_name = cmd.instrument_id.map(|id| id.symbol.as_str().to_string());
         let mut page: u32 = 1;
         let mut all_trades: Vec<DeriveTrade> = Vec::new();
@@ -2792,6 +3566,7 @@ impl DeriveReconciliationContext {
             .map(|id| id.as_str().to_string());
 
         let mut reports = Vec::with_capacity(all_trades.len());
+        let mut skipped = 0_usize;
 
         for trade in all_trades {
             if let Some(target) = venue_order_id_filter.as_deref()
@@ -2821,10 +3596,13 @@ impl DeriveReconciliationContext {
                     reports.push(report);
                 }
                 Ok(None) => {}
-                Err(e) => log::warn!("Skipping trade in fill report: {e}"),
+                Err(e) => {
+                    skipped += 1;
+                    log::warn!("Skipping trade in fill report: {e}");
+                }
             }
         }
-        Ok(reports)
+        Ok((reports, skipped))
     }
 
     async fn generate_position_status_snapshot(
@@ -2839,6 +3617,7 @@ impl DeriveReconciliationContext {
         let ts_init = self.clock.get_time_ns();
         let mut reports = Vec::with_capacity(positions.len());
         let mut instruments = AHashSet::with_capacity(positions.len());
+        let mut skipped = 0_usize;
 
         for position in positions {
             let instrument_id = format_instrument_id(position.instrument_name);
@@ -2859,20 +3638,36 @@ impl DeriveReconciliationContext {
                 ts_init,
             ) {
                 Ok(report) => reports.push(report),
-                Err(e) => log::warn!("Skipping position in status report: {e}"),
+                Err(e) => {
+                    skipped += 1;
+                    log::warn!("Skipping position in status report: {e}");
+                }
             }
         }
 
         Ok(PositionStatusSnapshot {
             reports,
             instruments,
+            skipped,
         })
     }
 
+    /// Best-effort mass status, as every other caller expects.
     async fn generate_mass_status(
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<ExecutionMassStatus> {
+        let (mass_status, _) =
+            Box::pin(self.generate_mass_status_with_completeness(lookback_mins)).await?;
+        Ok(mass_status)
+    }
+
+    /// As [`Self::generate_mass_status`], also returning whether every row the
+    /// venue sent was converted.
+    async fn generate_mass_status_with_completeness(
+        &self,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<(ExecutionMassStatus, ReportCompleteness)> {
         log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
 
         let ts_now = self.clock.get_time_ns();
@@ -2906,12 +3701,22 @@ impl DeriveReconciliationContext {
         let position_cmd =
             GeneratePositionStatusReports::new(UUID4::new(), ts_now, None, None, None, None, None);
 
-        let (history_order_reports, open_order_reports, mut fill_reports, position_snapshot) = tokio::try_join!(
-            self.generate_order_status_reports(&history_order_cmd, true),
-            self.generate_order_status_reports(&open_order_cmd, false),
-            self.generate_fill_reports(fill_cmd),
+        let (
+            (history_order_reports, skipped_history_orders),
+            (open_order_reports, skipped_open_orders),
+            (mut fill_reports, skipped_fills),
+            position_snapshot,
+        ) = tokio::try_join!(
+            self.generate_order_status_reports_with_completeness(&history_order_cmd, true),
+            self.generate_order_status_reports_with_completeness(&open_order_cmd, false),
+            self.generate_fill_reports_with_completeness(fill_cmd),
             self.generate_position_status_snapshot(&position_cmd),
         )?;
+        let completeness = ReportCompleteness {
+            skipped_orders: skipped_history_orders + skipped_open_orders,
+            skipped_fills,
+            skipped_positions: position_snapshot.skipped,
+        };
         let detached_history_order_ids: AHashSet<VenueOrderId> = history_order_reports
             .iter()
             .filter(|report| report.client_order_id.is_none())
@@ -2954,6 +3759,7 @@ impl DeriveReconciliationContext {
         let PositionStatusSnapshot {
             reports: position_reports,
             instruments: position_instruments,
+            skipped: _,
         } = position_snapshot;
         let mut mass_status =
             ExecutionMassStatus::new(self.client_id, self.account_id, *DERIVE_VENUE, ts_now, None);
@@ -2970,7 +3776,7 @@ impl DeriveReconciliationContext {
             ts_now,
         );
 
-        Ok(mass_status)
+        Ok((mass_status, completeness))
     }
 }
 
@@ -3037,6 +3843,8 @@ fn ambiguous_history_client_order_ids(orders: &[DeriveOrder]) -> AHashSet<Client
 struct PositionStatusSnapshot {
     reports: Vec<PositionStatusReport>,
     instruments: AHashSet<InstrumentId>,
+    /// Position rows the venue sent that could not be converted.
+    skipped: usize,
 }
 
 // Reason text and post-only classification for a definitive WS write failure.
@@ -3670,13 +4478,23 @@ fn normal_order_signature_expiry(
     })
 }
 
+/// Fetches a top-of-book quote to price a market order against.
+///
+/// Uses the instrument-specific `public/get_ticker` endpoint, not the bulk
+/// `public/get_tickers` map: during the outage this failover exists for, the
+/// bulk map comes back empty, which would reject every market order — entries
+/// and risk-reducing exits alike. The returned quote is validated for a usable
+/// two-sided book and bounded against `max_quote_age_secs` before anything is
+/// signed; `None` leaves the age unbounded, which is the default-off
+/// WebSocket-only configuration.
 async fn refresh_market_order_quote(
     http_client: &DeriveHttpClient,
     venue_symbol: &str,
     instrument: &DeriveInstrument,
     clock: &'static AtomicTime,
+    max_quote_age_secs: Option<u64>,
 ) -> anyhow::Result<QuoteTick> {
-    let ticker = http_client.get_ticker(venue_symbol).await?;
+    let ticker = http_client.get_ticker_for_instrument(venue_symbol).await?;
     let price_precision = Price::from_decimal(instrument.tick_size)
         .with_context(|| format!("invalid Derive tick_size for {venue_symbol}"))?
         .precision;
@@ -3684,12 +4502,68 @@ async fn refresh_market_order_quote(
         .with_context(|| format!("invalid Derive amount_step for {venue_symbol}"))?
         .precision;
 
-    parse_ticker_quote_from_rest(
-        &ticker,
-        price_precision,
-        size_precision,
-        clock.get_time_ns(),
-    )
+    let ts_init = clock.get_time_ns();
+    let quote = parse_ticker_quote_from_rest(&ticker, price_precision, size_precision, ts_init)?;
+
+    anyhow::ensure!(
+        quote.bid_price.as_decimal() > Decimal::ZERO
+            && quote.ask_price.as_decimal() > Decimal::ZERO
+            && !quote.bid_size.is_zero()
+            && !quote.ask_size.is_zero()
+            && quote.bid_price < quote.ask_price,
+        "unusable Derive REST quote for {venue_symbol}: bid={} ask={} bid_size={} ask_size={}",
+        quote.bid_price,
+        quote.ask_price,
+        quote.bid_size,
+        quote.ask_size,
+    );
+
+    if let Some(max_quote_age_secs) = max_quote_age_secs {
+        anyhow::ensure!(
+            quote_is_fresh(
+                Some(quote.ts_event),
+                ts_init.as_u64(),
+                Some(max_quote_age_secs)
+            ),
+            "stale or future-dated Derive REST quote for {venue_symbol}: ts_event={} ts_now={ts_init} max_age_secs={max_quote_age_secs}",
+            quote.ts_event,
+        );
+    }
+
+    Ok(quote)
+}
+
+/// Classifies a replace by whether it can increase exposure.
+///
+/// A larger quantity increases exposure directly; moving the limit price toward
+/// or through the market (up for a buy, down for a sell) increases the chance
+/// of being filled. Either makes the replace risk-increasing and subject to the
+/// full entry gate. A reduce-only order's replace can never increase exposure,
+/// and a replace with no resolvable target price is treated conservatively as
+/// risk-increasing.
+fn replace_write_kind(
+    order: &OrderAny,
+    target_quantity: Quantity,
+    target_price: Option<Price>,
+) -> RestWriteKind {
+    if order.is_reduce_only() {
+        return RestWriteKind::ReducingReplace;
+    }
+    if target_quantity > order.quantity() {
+        return RestWriteKind::RiskIncreasingReplace;
+    }
+    let (Some(target_price), Some(current_price)) = (target_price, order.price()) else {
+        return RestWriteKind::RiskIncreasingReplace;
+    };
+    let more_aggressive = match order.order_side() {
+        OrderSide::Buy => target_price > current_price,
+        OrderSide::Sell => target_price < current_price,
+    };
+    if more_aggressive {
+        RestWriteKind::RiskIncreasingReplace
+    } else {
+        RestWriteKind::ReducingReplace
+    }
 }
 
 /// Rounds `value` to the nearest multiple of `tick_size`. Buys round up so
