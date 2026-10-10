@@ -1304,10 +1304,47 @@ impl DeriveWsExecutionHandle {
         params: &DeriveOrderParams,
         reservation: MatchingRateLimitReservation,
     ) -> Result<DeriveOrder> {
+        self.submit_order_after_rate_limit_checked(params, reservation, || Ok(()))
+            .await
+    }
+
+    /// Same as [`Self::submit_order_after_rate_limit`], but calls
+    /// `before_send` as the last check before the request is actually
+    /// enqueued -- after authentication, after the reservation's window has
+    /// been refreshed, and after acquiring the current `cmd_tx`, so a
+    /// caller can re-check for newly-arrived ambiguity (e.g. a concurrent
+    /// write on the same client order ID turning the gate uncertain) in the
+    /// exact gap a plain pre-call check cannot see across.
+    ///
+    /// Signing happens in the caller *before* this is called (reserving
+    /// quota only after signing would spend the signature's TTL on the
+    /// pacing wait instead), so this is the only point left where such a
+    /// check can still prevent the send.
+    ///
+    /// # Errors
+    ///
+    /// If `before_send` returns `Err`, that error is propagated verbatim
+    /// and nothing is enqueued: no frame is sent, no pending-request
+    /// correlation is registered, and the reservation's cell is not
+    /// consumed by a request that never departs. The rate limiter has no
+    /// refund path, so if `refresh_matching_reservation` already re-paced
+    /// onto a newly rolled window before `before_send` aborts, that
+    /// window's cell is spent regardless -- an accepted cost of fail-closed
+    /// correctness, not a leak to chase down.
+    pub(crate) async fn submit_order_after_rate_limit_checked<F>(
+        &self,
+        params: &DeriveOrderParams,
+        reservation: MatchingRateLimitReservation,
+        before_send: F,
+    ) -> Result<DeriveOrder>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         self.ensure_authenticated(methods::PRIVATE_ORDER)?;
         debug_assert_eq!(reservation.method, methods::PRIVATE_ORDER);
         self.refresh_matching_reservation(&reservation).await;
         let cmd_tx = self.cmd_tx.read().await.clone();
+        before_send()?;
         let result: DeriveOrderResult = send_request_typed_after_rate_limit(
             &self.rate_limiter,
             &cmd_tx,
@@ -1345,10 +1382,27 @@ impl DeriveWsExecutionHandle {
         params: &DeriveTriggerOrderParams,
         reservation: MatchingRateLimitReservation,
     ) -> Result<DeriveOrder> {
+        self.submit_trigger_order_after_rate_limit_checked(params, reservation, || Ok(()))
+            .await
+    }
+
+    /// Same as [`Self::submit_trigger_order_after_rate_limit`]; see
+    /// [`Self::submit_order_after_rate_limit_checked`] for the exact
+    /// ordering and error-propagation guarantees `before_send` gets.
+    pub(crate) async fn submit_trigger_order_after_rate_limit_checked<F>(
+        &self,
+        params: &DeriveTriggerOrderParams,
+        reservation: MatchingRateLimitReservation,
+        before_send: F,
+    ) -> Result<DeriveOrder>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         self.ensure_authenticated(methods::PRIVATE_TRIGGER_ORDER)?;
         debug_assert_eq!(reservation.method, methods::PRIVATE_TRIGGER_ORDER);
         self.refresh_matching_reservation(&reservation).await;
         let cmd_tx = self.cmd_tx.read().await.clone();
+        before_send()?;
         let result: DeriveOrderResult = send_request_typed_after_rate_limit(
             &self.rate_limiter,
             &cmd_tx,
@@ -1381,10 +1435,27 @@ impl DeriveWsExecutionHandle {
         params: &DeriveReplaceParams,
         reservation: MatchingRateLimitReservation,
     ) -> Result<DeriveReplaceOutcome> {
+        self.modify_order_after_rate_limit_checked(params, reservation, || Ok(()))
+            .await
+    }
+
+    /// Same as [`Self::modify_order_after_rate_limit`]; see
+    /// [`Self::submit_order_after_rate_limit_checked`] for the exact
+    /// ordering and error-propagation guarantees `before_send` gets.
+    pub(crate) async fn modify_order_after_rate_limit_checked<F>(
+        &self,
+        params: &DeriveReplaceParams,
+        reservation: MatchingRateLimitReservation,
+        before_send: F,
+    ) -> Result<DeriveReplaceOutcome>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         self.ensure_authenticated(methods::PRIVATE_REPLACE)?;
         debug_assert_eq!(reservation.method, methods::PRIVATE_REPLACE);
         self.refresh_matching_reservation(&reservation).await;
         let cmd_tx = self.cmd_tx.read().await.clone();
+        before_send()?;
         let result: DeriveReplaceResult = send_request_typed_after_rate_limit(
             &self.rate_limiter,
             &cmd_tx,
@@ -2182,9 +2253,16 @@ fn subscription_outcome(
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::common::rate_limit::RateBucket;
+    use crate::{
+        common::{
+            enums::{DeriveOrderSide, DeriveOrderType, DeriveTimeInForce},
+            rate_limit::RateBucket,
+        },
+        http::query::DeriveSignedEnvelope,
+    };
 
     impl SessionEpoch {
         pub(crate) fn for_test(generation: u64, epoch: u64) -> Self {
@@ -2560,6 +2638,138 @@ mod tests {
                 .is_none(),
             "an ACK for a request sent under the old session must not be recorded as a \
              confirmation under whatever session happens to be current when the caller resumes",
+        );
+    }
+
+    fn test_order_params() -> DeriveOrderParams {
+        DeriveOrderParams {
+            envelope: DeriveSignedEnvelope {
+                subaccount_id: 30769,
+                nonce: 1,
+                signer: "0xsigner".to_string(),
+                signature_expiry_sec: 1_700_000_600,
+                signature: SecretString::from("0xabc"),
+            },
+            instrument_name: "ETH-PERP".into(),
+            direction: DeriveOrderSide::Buy,
+            order_type: DeriveOrderType::Limit,
+            time_in_force: DeriveTimeInForce::Gtc,
+            limit_price: dec!(3500.01),
+            amount: dec!(1.25),
+            max_fee: dec!(0.5),
+            label: "client-1".to_string(),
+            referral_code: "nautilus".to_string(),
+            reduce_only: None,
+            mmp: None,
+            trigger_price: None,
+            trigger_price_type: None,
+            trigger_type: None,
+        }
+    }
+
+    fn authenticated_execution_handle() -> DeriveWsExecutionHandle {
+        let client = DeriveWebSocketClient::with_credentials(
+            None,
+            DeriveEnvironment::Mainnet,
+            TransportBackend::default(),
+            None,
+            DeriveWsCredentials::new(
+                "0x000000000000000000000000000000000000aaaa",
+                "0x2ae8be44db8a590d20bffbe3b6872df9b569147d3bf6801a35a28281a4816bbd",
+            )
+            .unwrap(),
+            None,
+            None,
+        );
+        let execution = client.execution_handle();
+        execution.auth_tracker.succeed();
+        execution
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_submit_order_after_rate_limit_checked_aborts_without_enqueueing_on_before_send_error()
+     {
+        // R round-4 F2: `before_send` must run as the very last check
+        // before the request is actually enqueued -- after
+        // `ensure_authenticated`, after `refresh_matching_reservation`,
+        // and after acquiring `cmd_tx` -- and an `Err` from it must leave
+        // nothing enqueued: the ambiguity it detects must never reach the
+        // venue.
+        let execution = authenticated_execution_handle();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        *execution.cmd_tx.write().await = cmd_tx;
+
+        let reservation = MatchingRateLimitReservation {
+            method: methods::PRIVATE_ORDER,
+            instrument_name: Ustr::from("ETH-PERP"),
+            window: 0,
+        };
+        let params = test_order_params();
+
+        let err = execution
+            .submit_order_after_rate_limit_checked(&params, reservation, || {
+                Err(DeriveWsError::transport("ambiguity detected before send"))
+            })
+            .await
+            .expect_err("before_send's error must abort the send");
+
+        assert!(
+            matches!(err, DeriveWsError::Transport(_)),
+            "before_send's error must be propagated verbatim, was {err:?}",
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "nothing must be enqueued when before_send fails",
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_submit_order_after_rate_limit_checked_enqueues_once_when_before_send_accepts() {
+        let execution = authenticated_execution_handle();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        *execution.cmd_tx.write().await = cmd_tx;
+
+        let reservation = MatchingRateLimitReservation {
+            method: methods::PRIVATE_ORDER,
+            instrument_name: Ustr::from("ETH-PERP"),
+            window: 0,
+        };
+        let params = test_order_params();
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_for_closure = Arc::clone(&call_count);
+
+        tokio::spawn(async move {
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../test_data/spot/http_submit_order_response.json"
+            ))
+            .expect("fixture must parse");
+            let result = fixture
+                .get("result")
+                .cloned()
+                .expect("fixture must have a result field");
+            if let Some(HandlerCommand::Request { response_tx, .. }) = cmd_rx.recv().await {
+                let _ = response_tx.send(Ok(result));
+            }
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "exactly one request must be enqueued",
+            );
+        });
+
+        let result = execution
+            .submit_order_after_rate_limit_checked(&params, reservation, || {
+                call_count_for_closure.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .await;
+
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        assert!(
+            result.is_ok(),
+            "an accepting before_send must not change today's behaviour, was {result:?}",
         );
     }
 }

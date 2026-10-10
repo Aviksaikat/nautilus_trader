@@ -2947,11 +2947,14 @@ async fn test_two_sleeves_summing_to_the_reported_position_are_applied() {
         add_long_position_to_cache(
             &tc.cache,
             instrument_id,
-            StrategyId::from(strategy),
-            ClientOrderId::new(format!("STRAT-{sleeve}-FILL")),
-            VenueOrderId::new(format!("ord-{sleeve}")),
-            TradeId::new(format!("trade-{sleeve}")),
-            Quantity::from("0.030"),
+            SleevePosition {
+                strategy_id: StrategyId::from(strategy),
+                client_order_id: ClientOrderId::new(format!("STRAT-{sleeve}-FILL")),
+                venue_order_id: VenueOrderId::new(format!("ord-{sleeve}")),
+                trade_id: TradeId::new(format!("trade-{sleeve}")),
+                quantity: Quantity::from("0.030"),
+                ts_last: UnixNanos::from(1),
+            },
         );
     }
 
@@ -3112,6 +3115,288 @@ async fn test_feature_off_recovery_restores_connected_readiness_after_a_redial()
         Duration::from_secs(20),
     )
     .await;
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_a_newer_sleeve_does_not_waive_an_instruments_position_mismatch() {
+    // The venue reports 0.06 ETH while the cache holds only 0.01, and that one
+    // sleeve's last event is newer than the account snapshot. A timestamp is
+    // not proof that the venue view omits the local event — the position
+    // request ran after the account request it is compared against — so the
+    // mismatch must keep the generation unapplied rather than being waived.
+    let rest_state = RestState::default();
+    *rest_state.positions_response.lock().await = json!({
+        "positions": [sample_position_json("ETH-PERP", "0.06")],
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let ws_state = WsState::default();
+    let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
+        config.private_state_poll_interval_secs = Some(1);
+        config.max_account_state_age_secs = Some(30);
+        config.max_quote_age_secs = Some(30);
+        config
+    })
+    .await;
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    add_long_position_to_cache(
+        &tc.cache,
+        instrument_id,
+        SleevePosition {
+            strategy_id: StrategyId::from("S-FRESH-SLEEVE"),
+            client_order_id: ClientOrderId::from("STRAT-FRESH-SLEEVE-FILL"),
+            venue_order_id: VenueOrderId::from("ord-fresh-sleeve"),
+            trade_id: TradeId::from("trade-fresh-sleeve"),
+            quantity: Quantity::from("0.010"),
+            // Newer than any reconciliation snapshot this test will take.
+            ts_last: UnixNanos::from(u64::MAX - 1),
+        },
+    );
+
+    add_fresh_quote_to_cache(&tc.cache, instrument_id);
+    let entry = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-REST-NEWER-SLEEVE-ENTRY"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(entry.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&entry))
+        .expect("entry command handled");
+
+    let reason = denied_reason(&mut tc.rx, &entry.client_order_id()).await;
+    assert!(
+        reason.contains("fully reconciled private state"),
+        "a newer sleeve must not waive the instrument's mismatch: {reason}",
+    );
+    assert!(rest_state.submitted_orders.lock().await.is_empty());
+    assert!(ws_state.submitted_orders.lock().await.is_empty());
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_a_newer_sleeve_that_agrees_with_the_venue_still_admits() {
+    // The same freshly-updated sleeve, but now its aggregate matches what the
+    // venue reports. Agreement settles the instrument whatever the timestamps
+    // say, so the conservative rule above must not deny this case.
+    let rest_state = RestState::default();
+    *rest_state.positions_response.lock().await = json!({
+        "positions": [sample_position_json("ETH-PERP", "0.01")],
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let ws_state = WsState::default();
+    let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
+        config.private_state_poll_interval_secs = Some(1);
+        config.max_account_state_age_secs = Some(30);
+        config.max_quote_age_secs = Some(30);
+        config
+    })
+    .await;
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    add_long_position_to_cache(
+        &tc.cache,
+        instrument_id,
+        SleevePosition {
+            strategy_id: StrategyId::from("S-FRESH-SLEEVE"),
+            client_order_id: ClientOrderId::from("STRAT-FRESH-AGREE-FILL"),
+            venue_order_id: VenueOrderId::from("ord-fresh-agree"),
+            trade_id: TradeId::from("trade-fresh-agree"),
+            quantity: Quantity::from("0.010"),
+            ts_last: UnixNanos::from(u64::MAX - 1),
+        },
+    );
+
+    add_fresh_quote_to_cache(&tc.cache, instrument_id);
+    let entry = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-REST-NEWER-SLEEVE-AGREES"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(entry.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&entry))
+        .expect("entry command accepted");
+
+    wait_until(
+        || {
+            let state = rest_state.clone();
+            async move { !state.submitted_orders.lock().await.is_empty() }
+        },
+        "entry admitted when the fresh sleeve agrees with the venue",
+    )
+    .await;
+    assert_eq!(rest_state.submitted_orders.lock().await.len(), 1);
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_a_write_parked_on_rolled_window_quota_is_re_gated_before_enqueue() {
+    // The venue allows one matching request per second. The second entry clears
+    // the gate when it arrives, then has to wait for the next quota window
+    // before it can be sent. The first write turns ambiguous during that wait,
+    // so the parked one must be refused at the boundary rather than enqueued.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    *ws_state.order_reply.lock().await = Some(json!({
+        "error": {"code": -32603, "message": "Internal error"},
+    }));
+    // Long enough that the parked order clears the synchronous gate before the
+    // first write replies, short enough that it lands inside the same window.
+    rest_state
+        .get_instrument_delay_ms
+        .store(300, Ordering::SeqCst);
+    let mut tc =
+        build_client_with_config(rest_state.clone(), ws_state.clone(), None, |mut config| {
+            config.rest_fallback_enabled = true;
+            config.private_state_poll_interval_secs = Some(1);
+            config.max_account_state_age_secs = Some(30);
+            config.max_quote_age_secs = Some(30);
+            config.max_matching_requests_per_second = Some(1);
+            config
+        })
+        .await;
+    tc.client.connect().await.expect("initial connect succeeds");
+
+    // The first order's instrument is already known so it reaches the venue at
+    // once, consuming the window; the parked order must fetch its own.
+    let eth_instrument: DeriveInstrument =
+        serde_json::from_value(sample_instrument_json()).expect("instrument parses");
+    tc.client.cache_instrument(eth_instrument);
+
+    let eth = InstrumentId::from("ETH-PERP.DERIVE");
+    let btc = InstrumentId::from("BTC-PERP.DERIVE");
+    let parked = build_limit_order(
+        btc,
+        ClientOrderId::from("STRAT-WS-QUOTA-PARKED"),
+        OrderSide::Buy,
+        Price::from("3501.00"),
+        Quantity::from("1.000"),
+    );
+    let ambiguous = build_limit_order(
+        eth,
+        ClientOrderId::from("STRAT-WS-QUOTA-AMBIGUOUS"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    for order in [&parked, &ambiguous] {
+        tc.cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .expect("cache insert");
+    }
+
+    tc.client
+        .submit_order(submit_cmd(&parked))
+        .expect("parked submit accepted");
+    tc.client
+        .submit_order(submit_cmd(&ambiguous))
+        .expect("first submit accepted");
+
+    let reason = denied_or_rejected_reason(&mut tc.rx, &parked.client_order_id()).await;
+    assert!(
+        reason.contains("unknown venue outcome"),
+        "a write parked on quota must be re-gated before it enqueues: {reason}",
+    );
+    // Well past the one-second window the parked write was waiting for.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    let writes = ws_state.submitted_orders.lock().await;
+    assert_eq!(writes.len(), 1, "only the first entry may reach the venue");
+    assert_eq!(
+        writes[0]["label"].as_str(),
+        Some("STRAT-WS-QUOTA-AMBIGUOUS")
+    );
+    drop(writes);
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_feature_off_ambiguous_websocket_write_does_not_block_the_next_entry() {
+    // With the fallback feature disabled there is no reconciliation loop that
+    // could ever resolve an unresolved write, so this branch must not start
+    // tracking one: an ambiguous `-32603` has to leave subsequent orders
+    // exactly as they behaved before the feature existed.
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    *ws_state.order_reply.lock().await = Some(json!({
+        "error": {"code": -32603, "message": "Internal error"},
+    }));
+    let mut tc = build_client(rest_state.clone(), ws_state.clone()).await;
+    assert!(!tc.client.config().rest_fallback_enabled);
+    tc.client.connect().await.expect("connect succeeds");
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let first = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-OFF-AMBIGUOUS"),
+        OrderSide::Buy,
+        Price::from("3500.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(first.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&first))
+        .expect("first submit accepted");
+    wait_until(
+        || {
+            let ws = ws_state.clone();
+            async move { !ws.submitted_orders.lock().await.is_empty() }
+        },
+        "first WebSocket write",
+    )
+    .await;
+    assert_no_terminal_rejection(&mut tc.rx, &first.client_order_id()).await;
+
+    // The next entry must still be sent over the WebSocket, as before.
+    *ws_state.order_reply.lock().await = None;
+    let second = build_limit_order(
+        instrument_id,
+        ClientOrderId::from("STRAT-OFF-AFTER-AMBIGUOUS"),
+        OrderSide::Buy,
+        Price::from("3501.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(second.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&second))
+        .expect("second submit accepted");
+    wait_until_async(
+        || {
+            let ws = ws_state.clone();
+            async move { ws.submitted_orders.lock().await.len() >= 2 }
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    let writes = ws_state.submitted_orders.lock().await;
+    assert_eq!(
+        writes[1]["label"].as_str(),
+        Some("STRAT-OFF-AFTER-AMBIGUOUS"),
+        "the second entry must reach the venue unchanged with the feature off",
+    );
+    drop(writes);
     tc.client.disconnect().await.expect("disconnect succeeds");
 }
 
@@ -4529,15 +4814,31 @@ async fn drain_denied_without_submitted(
 
 /// Adds a long position for one strategy sleeve, as the engine would after a
 /// fill, so position aggregation across sleeves can be exercised.
-fn add_long_position_to_cache(
-    cache: &Rc<RefCell<Cache>>,
-    instrument_id: InstrumentId,
+/// Identity of one sleeve's position, bundled so the helper stays inside the
+/// argument-count limit.
+#[derive(Clone, Copy)]
+struct SleevePosition {
     strategy_id: StrategyId,
     client_order_id: ClientOrderId,
     venue_order_id: VenueOrderId,
     trade_id: TradeId,
     quantity: Quantity,
+    ts_last: UnixNanos,
+}
+
+fn add_long_position_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    sleeve: SleevePosition,
 ) {
+    let SleevePosition {
+        strategy_id,
+        client_order_id,
+        venue_order_id,
+        trade_id,
+        quantity,
+        ts_last,
+    } = sleeve;
     let derive_instrument: DeriveInstrument =
         serde_json::from_value(sample_instrument_json()).expect("instrument parses");
     let instrument = parse_derive_instrument_any(&derive_instrument, UnixNanos::default())
@@ -4560,8 +4861,8 @@ fn add_long_position_to_cache(
         Currency::USDC(),
         LiquiditySide::Taker,
         UUID4::new(),
-        UnixNanos::from(1),
-        UnixNanos::from(1),
+        ts_last,
+        ts_last,
         false,
         Some(PositionId::new(format!("{instrument_id}-{strategy_id}"))),
         None,

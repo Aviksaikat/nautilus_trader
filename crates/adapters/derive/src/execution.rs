@@ -135,6 +135,11 @@ const REST_GATE_PRIVATE_STATE: &str =
 const REST_GATE_QUOTE: &str =
     "Derive REST fallback has no sufficiently fresh quote for this instrument";
 
+/// Refusal reason when a reserved write's own record is gone by the time it
+/// reaches the enqueue boundary, so nothing would own its outcome.
+const REST_GATE_RESERVATION_LOST: &str =
+    "Derive execution lost this write's reservation before it was sent";
+
 /// Refusal reason when the targeted order's own write outcome is unknown.
 const REST_GATE_UNRESOLVED_ORDER: &str =
     "Derive REST fallback cannot act on this order while its write outcome is unresolved";
@@ -685,7 +690,7 @@ impl DeriveExecutionClient {
             // is newer than the snapshot is exempt, since a snapshot cannot
             // contain what did not yet exist when it was taken.
             let mut cached_signed: AHashMap<InstrumentId, Decimal> = AHashMap::new();
-            let mut changed_since_snapshot: AHashSet<InstrumentId> = AHashSet::new();
+            let mut locally_changed: AHashSet<InstrumentId> = AHashSet::new();
             for position in cache.positions_open_refs(
                 Some(&self.core.venue),
                 None,
@@ -702,7 +707,7 @@ impl DeriveExecutionClient {
                     .entry(position.instrument_id)
                     .or_insert(Decimal::ZERO) += signed;
                 if position.ts_last > reported.observed_at {
-                    changed_since_snapshot.insert(position.instrument_id);
+                    locally_changed.insert(position.instrument_id);
                 }
             }
 
@@ -713,9 +718,6 @@ impl DeriveExecutionClient {
                 .copied()
                 .collect();
             for instrument_id in instruments {
-                if changed_since_snapshot.contains(&instrument_id) {
-                    continue;
-                }
                 let reported_signed = reported
                     .positions
                     .get(&instrument_id)
@@ -725,12 +727,29 @@ impl DeriveExecutionClient {
                     .get(&instrument_id)
                     .copied()
                     .unwrap_or(Decimal::ZERO);
-                if cached != reported_signed {
-                    disagreement = Some(format!(
-                        "{instrument_id} net position cached={cached} reported={reported_signed}"
-                    ));
-                    break;
+                if cached == reported_signed {
+                    // Agreement settles it, whatever the timestamps say: a
+                    // local event after the snapshot that left the net
+                    // unchanged is consistent with it.
+                    continue;
                 }
+                // They disagree. A local event newer than the snapshot does not
+                // excuse the difference — the snapshot's own position request
+                // ran *after* the account request this timestamp is taken from,
+                // so a newer local event is no proof the venue view omits it,
+                // and the mismatch may just as easily be exposure that never
+                // reached the cache. Treat the instrument as indeterminate and
+                // wait for a generation whose snapshot starts after that local
+                // activity; this only delays the gate.
+                let detail = if locally_changed.contains(&instrument_id) {
+                    "indeterminate: local activity is newer than the snapshot"
+                } else {
+                    "mismatch"
+                };
+                disagreement = Some(format!(
+                    "{instrument_id} net position cached={cached} reported={reported_signed} ({detail})"
+                ));
+                break;
             }
         }
 
@@ -1647,6 +1666,7 @@ impl ExecutionClient for DeriveExecutionClient {
             .rest_fallback_enabled
             .then_some(self.config.max_quote_age_secs)
             .flatten();
+        let rest_fallback_enabled = self.config.rest_fallback_enabled;
 
         self.spawn_task("submit_order", async move {
             let instrument = match cached_or_fetch_instrument(
@@ -1804,16 +1824,12 @@ impl ExecutionClient for DeriveExecutionClient {
                         );
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
-                        emitter.emit_order_rejected(
-                            &order_for_task,
-                            &reason,
-                            ts,
-                            due_post_only,
-                        );
+                        emitter.emit_order_rejected(&order_for_task, &reason, ts, due_post_only);
                         return Ok(());
                     }
                 }
             };
+
 
             if is_trigger_order {
                 let nonce = match resolve_submit_nonce(
@@ -1884,36 +1900,68 @@ impl ExecutionClient for DeriveExecutionClient {
                     emitter.emit_order_rejected(&order_for_task, reason, ts, false);
                     return Ok(());
                 };
-                let write_reservation = match reserve_write(
-                    &rest_execution_state,
-                    order_for_task.client_order_id(),
-                    None,
-                    write_kind,
-                    WriteAdmission::WebSocket,
-                    clock.get_time_ns().as_u64(),
-                ) {
-                    Ok(write_reservation) => write_reservation,
-                    Err(halt_reason) => {
-                        log_rest_write_halted(
-                            &rest_execution_state,
-                            order_for_task.client_order_id(),
-                            write_kind,
-                            halt_reason,
-                            None,
-                            clock.get_time_ns().as_u64(),
-                        );
-                        dispatch_state.forget(&order_for_task.client_order_id());
-                        let ts = clock.get_time_ns();
-                        emitter.emit_order_rejected(&order_for_task, halt_reason, ts, false);
-                        return Ok(());
+                let write_reservation = if rest_fallback_enabled {
+                    match reserve_write(
+                        &rest_execution_state,
+                        order_for_task.client_order_id(),
+                        None,
+                        write_kind,
+                        WriteAdmission::WebSocket,
+                        clock.get_time_ns().as_u64(),
+                    ) {
+                        Ok(write_reservation) => Some(write_reservation),
+                        Err(halt_reason) => {
+                            log_rest_write_halted(
+                                &rest_execution_state,
+                                order_for_task.client_order_id(),
+                                write_kind,
+                                halt_reason,
+                                None,
+                                clock.get_time_ns().as_u64(),
+                            );
+                            dispatch_state.forget(&order_for_task.client_order_id());
+                            let ts = clock.get_time_ns();
+                            emitter.emit_order_rejected(&order_for_task, halt_reason, ts, false);
+                            return Ok(());
+                        }
                     }
+                } else {
+                    None
                 };
-                match ws_exec
-                    .submit_trigger_order_after_rate_limit(&payload, reservation)
-                    .await
-                {
+                let (before_send, refusal) = pre_send_check(
+                    &rest_execution_state,
+                    write_reservation.as_ref().map(WriteReservation::token),
+                );
+                let outcome = ws_exec
+                    .submit_trigger_order_after_rate_limit_checked(
+                        &payload,
+                        reservation,
+                        before_send,
+                    )
+                    .await;
+                let refused = { refusal.lock().take() };
+                if let Some(reason) = refused {
+                    if let Some(reservation) = write_reservation {
+                        reservation.resolve();
+                    }
+                    log_rest_write_halted(
+                        &rest_execution_state,
+                        order_for_task.client_order_id(),
+                        write_kind,
+                        reason,
+                        None,
+                        clock.get_time_ns().as_u64(),
+                    );
+                    dispatch_state.forget(&order_for_task.client_order_id());
+                    let ts = clock.get_time_ns();
+                    emitter.emit_order_rejected(&order_for_task, reason, ts, false);
+                    return Ok(());
+                }
+                match outcome {
                     Ok(order) => {
-                        write_reservation.resolve();
+                        if let Some(reservation) = write_reservation {
+                            reservation.resolve();
+                        }
                         let venue_order_id = VenueOrderId::new(order.order_id.as_str());
                         dispatch_state.record_venue_order_id(
                             order_for_task.client_order_id(),
@@ -1940,10 +1988,14 @@ impl ExecutionClient for DeriveExecutionClient {
                             "Derive trigger submit for {} returned ambiguous WS outcome: {e}; awaiting reconciliation",
                             order_for_task.client_order_id(),
                         );
-                        write_reservation.mark_ambiguous(clock.get_time_ns().as_u64());
+                        if let Some(reservation) = write_reservation {
+                            reservation.mark_ambiguous(clock.get_time_ns().as_u64());
+                        }
                     }
                     Err(e) => {
-                        write_reservation.resolve();
+                        if let Some(reservation) = write_reservation {
+                            reservation.resolve();
+                        }
                         let (reason, due_post_only) = ws_rejection_reason(&e);
                         log::debug!(
                             "Derive rejected trigger order {}: {reason}",
@@ -2118,35 +2170,89 @@ impl ExecutionClient for DeriveExecutionClient {
                 return Ok(());
             };
             // Re-apply admission here, not only when the command arrived: the
-            // quota wait above can be long, and a write that turned ambiguous
-            // meanwhile must halt this one before it reaches the venue.
-            let write_reservation = match reserve_write(
-                &rest_execution_state,
-                order_for_task.client_order_id(),
-                None,
-                write_kind,
-                WriteAdmission::WebSocket,
-                clock.get_time_ns().as_u64(),
-            ) {
-                Ok(reservation) => reservation,
-                Err(reason) => {
-                    log_rest_write_halted(
-                        &rest_execution_state,
-                        order_for_task.client_order_id(),
-                        write_kind,
-                        reason,
-                        None,
-                        clock.get_time_ns().as_u64(),
-                    );
-                    dispatch_state.forget(&order_for_task.client_order_id());
-                    let ts = clock.get_time_ns();
-                    emitter.emit_order_rejected(&order_for_task, reason, ts, false);
-                    return Ok(());
+            // instrument resolution and matching-quota waits above can be
+            // long, and a write that turned ambiguous meanwhile must halt this
+            // one before it reaches the venue.
+            //
+            // This is as close to the enqueue as the client's API allows. The
+            // send helper still awaits `refresh_matching_reservation` (a no-op
+            // unless signing crossed a window boundary) and the command-sender
+            // read lock before it enqueues, so a halt appearing inside that
+            // window is not caught. Reserving quota after signing would close
+            // it but would spend the signature's TTL on pacing, which
+            // `test_deeply_paced_submit_builds_signature_after_matching_quota_wait`
+            // exists to prevent. Closing it properly needs a pre-send check
+            // inside the client.
+            //
+            // Only when the fallback feature is enabled. With it off there is
+            // no reconciliation loop to ever resolve an unresolved record, so
+            // tracking one here would halt entries for the rest of the process
+            // on the first ambiguous response — a regression on a path this
+            // branch is meant to leave untouched.
+            let write_reservation = if rest_fallback_enabled {
+                match reserve_write(
+                    &rest_execution_state,
+                    order_for_task.client_order_id(),
+                    None,
+                    write_kind,
+                    WriteAdmission::WebSocket,
+                    clock.get_time_ns().as_u64(),
+                ) {
+                    Ok(reservation) => Some(reservation),
+                    Err(reason) => {
+                        log_rest_write_halted(
+                            &rest_execution_state,
+                            order_for_task.client_order_id(),
+                            write_kind,
+                            reason,
+                            None,
+                            clock.get_time_ns().as_u64(),
+                        );
+                        dispatch_state.forget(&order_for_task.client_order_id());
+                        let ts = clock.get_time_ns();
+                        emitter.emit_order_rejected(&order_for_task, reason, ts, false);
+                        return Ok(());
+                    }
                 }
+            } else {
+                None
             };
-            match ws_exec.submit_order_after_rate_limit(&payload, reservation).await {
+            let (before_send, refusal) = pre_send_check(
+                &rest_execution_state,
+                write_reservation.as_ref().map(WriteReservation::token),
+            );
+            let outcome = ws_exec
+                .submit_order_after_rate_limit_checked(&payload, reservation, before_send)
+                .await;
+            // Copy the refusal out before doing anything that takes a state
+            // lock, so no guard is held across the refusal handling.
+            let refused = { refusal.lock().take() };
+            if let Some(reason) = refused {
+                // The request was stopped at the enqueue boundary, so it never
+                // reached the venue: retire the record definitively rather than
+                // leaving an unresolved write for something that was not sent,
+                // and refuse the command the same way the admission gate would.
+                if let Some(reservation) = write_reservation {
+                    reservation.resolve();
+                }
+                log_rest_write_halted(
+                    &rest_execution_state,
+                    order_for_task.client_order_id(),
+                    write_kind,
+                    reason,
+                    None,
+                    clock.get_time_ns().as_u64(),
+                );
+                dispatch_state.forget(&order_for_task.client_order_id());
+                let ts = clock.get_time_ns();
+                emitter.emit_order_rejected(&order_for_task, reason, ts, false);
+                return Ok(());
+            }
+            match outcome {
                 Ok(_) => {
-                    write_reservation.resolve();
+                    if let Some(reservation) = write_reservation {
+                        reservation.resolve();
+                    }
                     log::debug!(
                         "Order submitted: client_order_id={}",
                         order_for_task.client_order_id(),
@@ -2158,10 +2264,14 @@ impl ExecutionClient for DeriveExecutionClient {
                         "Derive submit for {} returned ambiguous WS outcome: {e}; awaiting reconciliation",
                         order_for_task.client_order_id(),
                     );
-                    write_reservation.mark_ambiguous(clock.get_time_ns().as_u64());
+                    if let Some(reservation) = write_reservation {
+                        reservation.mark_ambiguous(clock.get_time_ns().as_u64());
+                    }
                 }
                 Err(e) => {
-                    write_reservation.resolve();
+                    if let Some(reservation) = write_reservation {
+                        reservation.resolve();
+                    }
                     let (reason, due_post_only) = ws_rejection_reason(&e);
                     log::debug!(
                         "Derive rejected order {}: {reason}",
@@ -2265,6 +2375,7 @@ impl ExecutionClient for DeriveExecutionClient {
             }
         }
         let rest_execution_state = Arc::clone(&self.rest_execution_state);
+        let rest_fallback_enabled = self.config.rest_fallback_enabled;
 
         self.spawn_task("cancel_order", async move {
             if use_rest_fallback {
@@ -2326,27 +2437,31 @@ impl ExecutionClient for DeriveExecutionClient {
             // A cancel is exposure-reducing, so admission is only about the
             // venue order it targets; the reservation gives this operation
             // ownership of its own record on the WebSocket path too.
-            let mut ws_cancel_reservation = match reserve_write(
-                &rest_execution_state,
-                client_order_id,
-                venue_order_id,
-                RestWriteKind::Cancel,
-                WriteAdmission::WebSocket,
-                clock.get_time_ns().as_u64(),
-            ) {
-                Ok(reservation) => Some(reservation),
-                Err(halt_reason) => {
-                    log::warn!("Cannot cancel {client_order_id}: {halt_reason}");
-                    emitter.emit_order_cancel_rejected_event(
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
-                        venue_order_id,
-                        halt_reason,
-                        clock.get_time_ns(),
-                    );
-                    return Ok(());
+            let mut ws_cancel_reservation = if rest_fallback_enabled {
+                match reserve_write(
+                    &rest_execution_state,
+                    client_order_id,
+                    venue_order_id,
+                    RestWriteKind::Cancel,
+                    WriteAdmission::WebSocket,
+                    clock.get_time_ns().as_u64(),
+                ) {
+                    Ok(reservation) => Some(reservation),
+                    Err(halt_reason) => {
+                        log::warn!("Cannot cancel {client_order_id}: {halt_reason}");
+                        emitter.emit_order_cancel_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            venue_order_id,
+                            halt_reason,
+                            clock.get_time_ns(),
+                        );
+                        return Ok(());
+                    }
                 }
+            } else {
+                None
             };
             let outcome = match venue_order_id {
                 Some(venue_order_id) if is_trigger_order => {
@@ -2722,6 +2837,7 @@ impl ExecutionClient for DeriveExecutionClient {
         let rest_execution_state = Arc::clone(&self.rest_execution_state);
         let max_account_state_age_secs = self.config.max_account_state_age_secs;
         let quote_max_age_secs = self.config.max_quote_age_secs;
+        let rest_fallback_enabled = self.config.rest_fallback_enabled;
 
         self.spawn_task("modify_order", async move {
             let instrument = match cached_or_fetch_instrument(
@@ -2749,6 +2865,10 @@ impl ExecutionClient for DeriveExecutionClient {
                 }
             };
 
+            // Quota is reserved *before* signing on purpose: the signature
+            // carries an expiry, and a write paced into a later window would
+            // otherwise spend that TTL waiting. See the note on the admission
+            // check below for the gap this leaves.
             let matching_reservation = if use_rest_fallback {
                 None
             } else {
@@ -2759,7 +2879,9 @@ impl ExecutionClient for DeriveExecutionClient {
                     Ok(reservation) => Some(reservation),
                     Err(e) => {
                         let (reason, _) = ws_rejection_reason(&e);
-                        log::warn!("Cannot reserve Derive replace quota for {client_order_id}: {reason}");
+                        log::warn!(
+                            "Cannot reserve Derive replace quota for {client_order_id}: {reason}"
+                        );
                         let ts = clock.get_time_ns();
                         emitter.emit_order_modify_rejected_event(
                             strategy_id,
@@ -2844,25 +2966,31 @@ impl ExecutionClient for DeriveExecutionClient {
             {
                 let now_ns = clock.get_time_ns().as_u64();
                 let admission = if use_rest_fallback {
-                    WriteAdmission::Fallback {
+                    Some(WriteAdmission::Fallback {
                         quote_ts_event: cached_quote_ts_event,
                         bounds: FreshnessBounds {
                             private_state_secs: max_account_state_age_secs,
                             quote_secs: quote_max_age_secs,
                         },
-                    }
+                    })
+                } else if rest_fallback_enabled {
+                    Some(WriteAdmission::WebSocket)
                 } else {
-                    WriteAdmission::WebSocket
+                    // Feature off: no record to keep, exactly as before.
+                    None
                 };
-                match reserve_write(
-                    &rest_execution_state,
-                    client_order_id,
-                    Some(stale_venue_order_id),
-                    write_kind,
-                    admission,
-                    now_ns,
-                ) {
-                    Ok(reservation) => replace_reservation = Some(reservation),
+                match admission.map_or(Ok(None), |admission| {
+                    reserve_write(
+                        &rest_execution_state,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        write_kind,
+                        admission,
+                        now_ns,
+                    )
+                    .map(Some)
+                }) {
+                    Ok(reservation) => replace_reservation = reservation,
                     Err(reason) => {
                         log_rest_write_halted(
                             &rest_execution_state,
@@ -2914,10 +3042,42 @@ impl ExecutionClient for DeriveExecutionClient {
                     );
                     return Ok(());
                 };
-                match ws_exec
-                    .modify_order_after_rate_limit(&payload, reservation)
-                    .await
-                {
+                let (before_send, refusal) = pre_send_check(
+                    &rest_execution_state,
+                    replace_reservation.as_ref().map(WriteReservation::token),
+                );
+                let result = ws_exec
+                    .modify_order_after_rate_limit_checked(&payload, reservation, before_send)
+                    .await;
+                let refused = { refusal.lock().take() };
+                if let Some(reason) = refused {
+                    // Stopped at the enqueue boundary, so nothing reached the
+                    // venue: retire the record and undo the pending-modify
+                    // marker this task set before the send.
+                    if let Some(reservation) = replace_reservation.take() {
+                        reservation.resolve();
+                    }
+                    dispatch_state.clear_pending_modify(&client_order_id);
+                    log_rest_write_halted(
+                        &rest_execution_state,
+                        client_order_id,
+                        write_kind,
+                        reason,
+                        cached_quote_ts_event,
+                        clock.get_time_ns().as_u64(),
+                    );
+                    let ts = clock.get_time_ns();
+                    emitter.emit_order_modify_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        reason,
+                        ts,
+                    );
+                    return Ok(());
+                }
+                match result {
                     Ok(outcome) => (Ok(outcome), false),
                     Err(e) => {
                         let ambiguous = is_write_outcome_ambiguous_ws(&e);
@@ -3215,6 +3375,12 @@ struct WriteReservation {
 }
 
 impl WriteReservation {
+    /// The token this reservation owns, for the pre-send check that runs inside
+    /// the WebSocket client while the guard is still held here.
+    const fn token(&self) -> OperationToken {
+        self.token
+    }
+
     /// Records a definitive outcome: the write's record is retired.
     fn resolve(mut self) {
         self.settled = true;
@@ -3333,6 +3499,36 @@ impl RestExecutionState {
         }
     }
 
+    /// Final check, run by the WebSocket client immediately before it enqueues
+    /// a reserved write.
+    ///
+    /// Everything between admission and the enqueue — the client's window
+    /// re-pacing and its command-sender lock — happens after this write was
+    /// admitted, so another write's outcome can become unknown in the
+    /// meantime. Refusing here is the last point at which the request can be
+    /// stopped without having reached the venue. One lock, taken once.
+    fn check_before_send(&self, token: OperationToken) -> Result<(), &'static str> {
+        let unresolved = self.unresolved_writes.lock();
+        let Some(write) = unresolved.get(&token) else {
+            return Err(REST_GATE_RESERVATION_LOST);
+        };
+        if !write.kind.is_risk_increasing() {
+            // The same asymmetry the admission gate applies: an
+            // exposure-reducing write is never held up by uncertainty about a
+            // *different* order, and the conflict on its own target was settled
+            // at admission and cannot change here. Blocking these would take
+            // the de-risking lever away during exactly the halt it exists for.
+            return Ok(());
+        }
+        if unresolved
+            .iter()
+            .any(|(other, write)| *other != token && write.stage == WriteStage::Ambiguous)
+        {
+            return Err(REST_GATE_UNRESOLVED_WRITE);
+        }
+        Ok(())
+    }
+
     /// Retires a write's record after a definitive outcome.
     fn retire_write(&self, token: OperationToken) {
         self.unresolved_writes.lock().remove(&token);
@@ -3447,6 +3643,46 @@ fn has_ambiguous_writes(state: &RestExecutionState) -> bool {
         .lock()
         .values()
         .any(|write| write.stage == WriteStage::Ambiguous)
+}
+
+/// Builds the pre-send check the WebSocket client runs immediately before it
+/// enqueues a reserved write, together with the slot that reports why it
+/// refused.
+///
+/// The refusal travels back through the slot rather than through the returned
+/// error, because the error variants that mean "the venue may have seen this"
+/// and "this never left the process" are not distinguishable by inspection —
+/// and recording an unsent write as ambiguous would halt entries for nothing.
+/// `None` for `token` (the fallback feature is disabled) always admits, so the
+/// default path behaves exactly as it did before this feature existed.
+type PreSendRefusal = Arc<Mutex<Option<&'static str>>>;
+
+fn pre_send_check(
+    state: &Arc<RestExecutionState>,
+    token: Option<OperationToken>,
+) -> (
+    impl FnOnce() -> std::result::Result<(), DeriveWsError> + use<>,
+    PreSendRefusal,
+) {
+    let refusal: PreSendRefusal = Arc::new(Mutex::new(None));
+    let check_state = Arc::clone(state);
+    let check_refusal = Arc::clone(&refusal);
+    let check = move || -> std::result::Result<(), DeriveWsError> {
+        let Some(token) = token else {
+            return Ok(());
+        };
+        match check_state.check_before_send(token) {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                *check_refusal.lock() = Some(reason);
+                // `NotConnected` is the one variant the shared policy already
+                // classifies as definitive precisely because it is returned
+                // before the frame is sent.
+                Err(DeriveWsError::NotConnected)
+            }
+        }
+    };
+    (check, refusal)
 }
 
 /// Admission gate applied immediately before a write is sent, on either
@@ -5542,6 +5778,136 @@ mod tests {
     }
 
     #[rstest]
+    fn test_pre_send_check_refuses_a_parked_write_when_another_turned_ambiguous() {
+        // This is the closure the WebSocket client runs after its window
+        // re-pacing and command-sender lock, immediately before the enqueue.
+        // A write admitted earlier and parked in there must be refused once
+        // another write's outcome becomes unknown.
+        let state = Arc::new(RestExecutionState::default());
+        let parked = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-PARKED"),
+            None,
+            RestWriteKind::RiskIncreasingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("parked write admitted");
+        let other = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-OTHER"),
+            None,
+            RestWriteKind::RiskIncreasingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("second write admitted while the first is in flight");
+
+        let (before_send, refusal) = pre_send_check(&state, Some(parked.token()));
+
+        // Still only in flight: the parked write may proceed.
+        assert!(state.check_before_send(parked.token()).is_ok());
+
+        // The other write's outcome becomes unknown while the parked one waits.
+        other.mark_ambiguous(1);
+
+        let result = before_send();
+        assert!(result.is_err(), "the parked write must be refused");
+        assert!(
+            !is_write_outcome_ambiguous_ws(&result.unwrap_err()),
+            "an unsent write must not be classified as an ambiguous outcome",
+        );
+        assert_eq!(
+            refusal.lock().take(),
+            Some(REST_GATE_UNRESOLVED_WRITE),
+            "the refusal reason travels back out of band, not through the error",
+        );
+        parked.resolve();
+    }
+
+    #[rstest]
+    fn test_pre_send_check_lets_an_exposure_reducing_write_through_a_halt() {
+        // A reduce-only write parked at the enqueue boundary must still go out
+        // while another order's outcome is unknown: that is the de-risking
+        // lever the halt is there to protect, not to remove.
+        let state = Arc::new(RestExecutionState::default());
+        let stuck = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-STUCK"),
+            None,
+            RestWriteKind::RiskIncreasingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("risk-increasing write admitted");
+        stuck.mark_ambiguous(1);
+
+        let reducing = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-REDUCING"),
+            None,
+            RestWriteKind::ReducingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("reduce-only write admitted despite the halt");
+        let (before_send, refusal) = pre_send_check(&state, Some(reducing.token()));
+
+        assert!(
+            before_send().is_ok(),
+            "the reduce-only write must still go out"
+        );
+        assert_eq!(refusal.lock().take(), None);
+        reducing.resolve();
+    }
+
+    #[rstest]
+    fn test_pre_send_check_refuses_when_its_own_reservation_is_gone() {
+        let state = Arc::new(RestExecutionState::default());
+        let reservation = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-LOST"),
+            None,
+            RestWriteKind::RiskIncreasingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("write admitted");
+        let token = reservation.token();
+        let (before_send, refusal) = pre_send_check(&state, Some(token));
+
+        // Nothing owns the outcome any more.
+        reservation.resolve();
+
+        assert!(before_send().is_err());
+        assert_eq!(refusal.lock().take(), Some(REST_GATE_RESERVATION_LOST));
+    }
+
+    #[rstest]
+    fn test_pre_send_check_admits_everything_when_the_fallback_feature_is_off() {
+        // With the feature disabled no reservation is taken, so the hook must
+        // never refuse — the default path has to behave exactly as it did
+        // before this feature existed, even with an ambiguous record present.
+        let state = Arc::new(RestExecutionState::default());
+        let stale = reserve_write(
+            &state,
+            ClientOrderId::from("STRAT-STALE"),
+            None,
+            RestWriteKind::RiskIncreasingSubmit,
+            WriteAdmission::WebSocket,
+            0,
+        )
+        .expect("write admitted");
+        stale.mark_ambiguous(1);
+        assert!(has_ambiguous_writes(&state));
+
+        let (before_send, refusal) = pre_send_check(&state, None);
+
+        assert!(before_send().is_ok());
+        assert_eq!(refusal.lock().take(), None);
+    }
+
+    #[rstest]
     fn test_a_dropped_reservation_becomes_resolvable_rather_than_stuck_in_flight() {
         // A task aborted between the reservation and the outcome (stop,
         // disconnect, teardown) must not leave a record that no evidence can
@@ -5613,6 +5979,13 @@ mod tests {
         // down with it. This drives that exact pairing: the test plays the gate
         // (holding `unresolved_writes`, then wanting `reported_state`) while a
         // worker logs a halt. It fails on a deadline instead of hanging.
+        // `log!` evaluates its arguments only when the level passes
+        // `max_level()`, so without raising it the inverted implementation
+        // never touches the locks at all and this regression would pass
+        // against it. (`log!` checks only `max_level()`, not the installed
+        // logger, so no logger needs to be registered.)
+        log::set_max_level(log::LevelFilter::Warn);
+
         let state = Arc::new(RestExecutionState::default());
         let logging_state = Arc::clone(&state);
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
@@ -5662,6 +6035,7 @@ mod tests {
     #[rstest]
     fn test_concurrent_admission_and_halt_logging_complete_under_contention() {
         // Secondary soak over the same pairing, on a hard deadline.
+        log::set_max_level(log::LevelFilter::Warn);
         let state = Arc::new(RestExecutionState::default());
         state
             .last_private_reconciliation_ns
