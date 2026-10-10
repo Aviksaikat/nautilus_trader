@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use nautilus_common::{cache::quote::QuoteCache, live::sender::EventSender, messages::DataEvent};
-use nautilus_core::{AtomicMap, AtomicSet, time::AtomicTime};
+use nautilus_core::{AtomicMap, AtomicSet, UnixNanos, time::AtomicTime};
 use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
 use parking_lot::Mutex;
 
@@ -37,4 +37,25 @@ pub(crate) struct WsMessageContext {
     pub(crate) active_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     pub(crate) subscription_lock: Arc<Mutex<()>>,
     pub(crate) quote_cache: Arc<Mutex<QuoteCache>>,
+    pub(crate) quote_feed_state: Arc<Mutex<ahash::AHashMap<InstrumentId, QuoteFeedState>>>,
+    pub(crate) ws_session_generation: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) ws_subscription_handle: crate::websocket::client::DeriveWebSocketSubscriptionHandle,
+    pub(crate) max_quote_age_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct QuoteFeedState {
+    pub(crate) last_published_event: Option<UnixNanos>,
+    pub(crate) last_ws_received: Option<UnixNanos>,
+    pub(crate) ws_subscription_confirmed: bool,
+    pub(crate) rest_polling: bool,
+    /// The transport connection epoch as of the most recent genuine WS
+    /// subscription confirmation or accepted quote. Fences
+    /// `ws_subscription_confirmed` and WS freshness against a prior
+    /// session's state surviving a reconnect: `has_subscription` reflects a
+    /// retained desired-subscription map, not a current-epoch
+    /// acknowledgement, so a stale confirmation from before a reconnect
+    /// must not let a new-session replay ticker (or the REST poller) treat
+    /// the WS as current before this epoch is reached again.
+    pub(crate) ws_epoch: Option<u64>,
 }

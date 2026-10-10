@@ -460,8 +460,7 @@ impl DeriveHttpClient {
     /// Fetches the current ticker snapshot for one instrument.
     ///
     /// This is a single-instrument convenience wrapper over
-    /// `public/get_tickers`, which replaced Derive's deprecated
-    /// `public/get_ticker` RPC.
+    /// `public/get_tickers`.
     ///
     /// # Errors
     ///
@@ -486,6 +485,28 @@ impl DeriveHttpClient {
                 ))
             })?;
         ticker.instrument_name = instrument_name.into();
+        Ok(ticker)
+    }
+
+    /// Fetches the instrument-specific `public/get_ticker` response.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`DeriveHttpError`] for transport, HTTP, JSON-RPC failures,
+    /// or when the response identifies a different instrument.
+    pub async fn get_ticker_for_instrument(
+        &self,
+        instrument_name: &str,
+    ) -> Result<DeriveTickerSnapshot> {
+        validate_ticker_instrument_name(instrument_name)?;
+        let params = serde_json::json!({"instrument_name": instrument_name});
+        let ticker: DeriveTickerSnapshot = self.send_public("public/get_ticker", &params).await?;
+        if ticker.instrument_name.as_str() != instrument_name {
+            return Err(DeriveHttpError::decode(format!(
+                "public/get_ticker response instrument `{}` did not match requested `{instrument_name}`",
+                ticker.instrument_name
+            )));
+        }
         Ok(ticker)
     }
 
@@ -782,6 +803,16 @@ fn ticker_request(instrument_name: &str) -> Result<TickerRequest<'_>> {
         currency,
         expiry_date: None,
     })
+}
+
+fn validate_ticker_instrument_name(instrument_name: &str) -> Result<()> {
+    if !instrument_name.contains('-') {
+        return Err(DeriveHttpError::decode(format!(
+            "invalid Derive instrument name `{instrument_name}`"
+        )));
+    }
+
+    Ok(())
 }
 
 fn build_client(

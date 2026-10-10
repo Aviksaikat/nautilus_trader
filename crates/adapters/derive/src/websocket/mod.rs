@@ -35,7 +35,7 @@ pub use client::{
     DeriveWebSocketClient, DeriveWebSocketSubscriptionHandle, DeriveWsCredentials,
     DeriveWsExecutionHandle,
 };
-pub(crate) use context::WsMessageContext;
+pub(crate) use context::{QuoteFeedState, WsMessageContext};
 pub use dispatch::{ORDER_DEDUP_CAPACITY, OrderIdentity, TRADE_DEDUP_CAPACITY, WsDispatchState};
 pub use error::DeriveWsError;
 pub use handler::DeriveWsMessage;

@@ -50,6 +50,19 @@ def test_derive_factories_expose_python_names() -> None:
     assert exec_factory.name() == DERIVE
 
 
+def test_derive_execution_config_accepts_rest_fallback_options() -> None:
+    """REST fallback config remains constructible through the Python API."""
+    config = DeriveExecutionClientConfig(
+        rest_fallback_enabled=True,
+        private_state_poll_interval_secs=5,
+        max_account_state_age_secs=15,
+    )
+
+    assert config.rest_fallback_enabled is True
+    assert config.private_state_poll_interval_secs == 5
+    assert config.max_account_state_age_secs == 15
+
+
 def test_live_node_builder_accepts_derive_data_factory() -> None:
     """
     Test live node builder accepts derive data factory.

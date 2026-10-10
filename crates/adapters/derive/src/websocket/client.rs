@@ -162,6 +162,12 @@ pub struct DeriveWebSocketClient {
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>>,
     subscriptions: Arc<DashMap<String, ()>>,
+    /// Channel -> connection epoch at which a `subscribe` acknowledgement
+    /// (initial or post-reconnect replay) was last actually confirmed by the
+    /// venue. Separate from `subscriptions`, which only tracks desired
+    /// channels and survives a reconnect unchanged, so it cannot by itself
+    /// distinguish a current-epoch acknowledgement from a stale one.
+    confirmed_channels: Arc<DashMap<String, u64>>,
     subscription_lock: Arc<tokio::sync::Mutex<()>>,
     task_handle: TaskSlot<()>,
     send_task: Arc<SharedTaskSlot<()>>,
@@ -214,9 +220,15 @@ impl Drop for DeriveWebSocketSetupGuard {
 pub struct DeriveWebSocketSubscriptionHandle {
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     subscriptions: Arc<DashMap<String, ()>>,
+    confirmed_channels: Arc<DashMap<String, u64>>,
     subscription_lock: Arc<tokio::sync::Mutex<()>>,
     request_timeout: Duration,
     rate_limiter: Arc<WsRateLimiter>,
+    /// The generic transport's own connection epoch, bumped at the instant a
+    /// low-level reconnect is detected (before session-level login/resubscribe
+    /// recovery runs). Distinct from `subscriptions`, which tracks desired
+    /// channels across reconnects and is not itself epoch-aware.
+    connection_epoch: Arc<ArcSwap<AtomicU64>>,
 }
 
 /// Cloneable handle for issuing signed `private/*` trading requests over the
@@ -323,6 +335,7 @@ impl DeriveWebSocketClient {
             cmd_tx: Arc::new(tokio::sync::RwLock::new(placeholder_tx)),
             out_rx: None,
             subscriptions: Arc::new(DashMap::new()),
+            confirmed_channels: Arc::new(DashMap::new()),
             subscription_lock: Arc::new(tokio::sync::Mutex::new(())),
             task_handle: TaskSlot::new(),
             send_task: Arc::new(SharedTaskSlot::new()),
@@ -465,6 +478,7 @@ impl DeriveWebSocketClient {
         let next_id = Arc::clone(&self.next_id);
         let credentials = self.credentials.clone();
         let subscriptions = Arc::clone(&self.subscriptions);
+        let confirmed_channels = Arc::clone(&self.confirmed_channels);
         let subscription_lock = Arc::clone(&self.subscription_lock);
         let conn_id = Arc::clone(&self.conn_id);
         let cmd_tx_for_loop = cmd_tx.clone();
@@ -481,6 +495,7 @@ impl DeriveWebSocketClient {
             let recovery_auth_tracker = auth_tracker.clone();
             let recovery_authenticated_epoch = Arc::clone(&authenticated_epoch);
             let recovery_subscriptions = Arc::clone(&subscriptions);
+            let recovery_confirmed_channels = Arc::clone(&confirmed_channels);
             let recovery_subscription_lock = Arc::clone(&subscription_lock);
             let recovery_rate_limiter = Arc::clone(&rate_limiter);
             let recovery_credentials = credentials.clone();
@@ -504,6 +519,7 @@ impl DeriveWebSocketClient {
                             &recovery_epoch,
                             recovery_credentials.as_ref(),
                             &recovery_subscriptions,
+                            &recovery_confirmed_channels,
                             &recovery_subscription_lock,
                             request_timeout,
                         )
@@ -872,9 +888,11 @@ impl DeriveWebSocketClient {
         DeriveWebSocketSubscriptionHandle {
             cmd_tx: Arc::clone(&self.cmd_tx),
             subscriptions: Arc::clone(&self.subscriptions),
+            confirmed_channels: Arc::clone(&self.confirmed_channels),
             subscription_lock: Arc::clone(&self.subscription_lock),
             request_timeout: self.request_timeout,
             rate_limiter: Arc::clone(&self.rate_limiter),
+            connection_epoch: Arc::clone(&self.connection_epoch),
         }
     }
 
@@ -925,8 +943,30 @@ impl DeriveWebSocketSubscriptionHandle {
         self.subscriptions.contains_key(channel)
     }
 
+    /// Returns the generic transport's current connection epoch.
+    ///
+    /// Bumped at the instant a low-level reconnect is detected, before any
+    /// session-level login/resubscribe recovery runs, so it is a reliable
+    /// fence for distinguishing data observed under the current transport
+    /// session from data (or confirmations) left over from a previous one.
+    pub(crate) fn connection_epoch(&self) -> u64 {
+        self.connection_epoch.load().load(Ordering::Acquire)
+    }
+
+    /// Returns `true` when `channel` was last acknowledged by the venue
+    /// (initial subscribe, or post-reconnect replay) under the *current*
+    /// connection epoch. `false` both when the channel has never been
+    /// acknowledged and when its last acknowledgement predates a
+    /// since-happened reconnect.
+    pub(crate) fn channel_confirmed_for_current_epoch(&self, channel: &str) -> bool {
+        self.confirmed_channels
+            .get(channel)
+            .is_some_and(|epoch| *epoch == self.connection_epoch())
+    }
+
     pub(crate) fn forget_subscription(&self, channel: &str) {
         self.subscriptions.remove(channel);
+        self.confirmed_channels.remove(channel);
     }
 
     pub(crate) fn remember_subscription(&self, channel: &str) {
@@ -1098,7 +1138,9 @@ impl DeriveWebSocketSubscriptionHandle {
             subscription_outcome(&params.channels, &result, SUBSCRIPTION_ACCEPTED_STATUSES);
 
         if confirmed.iter().any(|topic| topic == &channel) {
-            self.subscriptions.insert(channel, ());
+            self.subscriptions.insert(channel.clone(), ());
+            self.confirmed_channels
+                .insert(channel, self.connection_epoch());
         }
         failure.map_or(Ok(()), Err)
     }
@@ -1119,12 +1161,19 @@ impl DeriveWebSocketSubscriptionHandle {
         .await?;
 
         self.subscriptions.remove(&channel);
+        self.confirmed_channels.remove(&channel);
 
         Ok(())
     }
 }
 
 impl DeriveWsExecutionHandle {
+    /// Returns whether the latest WebSocket session has authenticated.
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.auth_tracker.is_authenticated()
+    }
+
     /// Returns the current WebSocket connection id used by trigger orders.
     #[must_use]
     pub fn conn_id(&self) -> String {
@@ -1814,6 +1863,7 @@ async fn recover_session(
     connection_epoch: &AtomicU64,
     creds: Option<&DeriveWsCredentials>,
     subscriptions: &DashMap<String, ()>,
+    confirmed_channels: &DashMap<String, u64>,
     subscription_lock: &tokio::sync::Mutex<()>,
     timeout: Duration,
 ) -> Result<u64> {
@@ -1837,7 +1887,15 @@ async fn recover_session(
                 .iter()
                 .map(|entry| entry.key().clone())
                 .collect();
-            subscribe_via_handler(rate_limiter, cmd_tx, channels, timeout, expected_epoch).await?;
+            subscribe_via_handler(
+                rate_limiter,
+                cmd_tx,
+                channels,
+                confirmed_channels,
+                timeout,
+                expected_epoch,
+            )
+            .await?;
 
             if !session_connection_is_active(connection_mode, connection_epoch, expected_epoch) {
                 return Err(DeriveWsError::transport(
@@ -1952,6 +2010,7 @@ async fn subscribe_via_handler(
     rate_limiter: &WsRateLimiter,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
     channels: Vec<String>,
+    confirmed_channels: &DashMap<String, u64>,
     timeout: Duration,
     connection_epoch: u64,
 ) -> Result<()> {
@@ -1972,11 +2031,18 @@ async fn subscribe_via_handler(
     )
     .await?;
 
-    let (_, failure) = subscription_outcome(
+    let (confirmed, failure) = subscription_outcome(
         &params.channels,
         &result,
         SUBSCRIPTION_REPLAY_ACCEPTED_STATUSES,
     );
+    // Record the epoch at which the venue actually re-acknowledged each
+    // replayed channel, so consumers can fence a stale pre-reconnect
+    // confirmation from a genuine current-epoch one (see
+    // `DeriveWebSocketSubscriptionHandle::channel_confirmed_for_current_epoch`).
+    for channel in confirmed {
+        confirmed_channels.insert(channel, connection_epoch);
+    }
     failure.map_or(Ok(()), Err)
 }
 

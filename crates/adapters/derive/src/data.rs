@@ -20,9 +20,9 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ahash::{AHashMap, AHashSet};
@@ -85,12 +85,13 @@ use crate::{
     providers::{
         DeriveInstrumentProvider, fetch_instrument_definitions, parse_instrument_definitions,
     },
+    websocket::client::DeriveWebSocketShutdownHandle,
     websocket::{
         DEFAULT_ORDERBOOK_DEPTH, DEFAULT_ORDERBOOK_GROUP, DEFAULT_TICKER_INTERVAL,
         DerivePublicWsData, DeriveTickerMsg, DeriveWebSocketClient,
-        DeriveWebSocketSubscriptionHandle, DeriveWsError, DeriveWsMessage, WsMessageContext,
-        bar_spec_to_derive_period, orderbook_channel, parse_candle_record, parse_funding_rate,
-        parse_funding_rate_history_record, parse_index_price, parse_mark_price,
+        DeriveWebSocketSubscriptionHandle, DeriveWsError, DeriveWsMessage, QuoteFeedState,
+        WsMessageContext, bar_spec_to_derive_period, orderbook_channel, parse_candle_record,
+        parse_funding_rate, parse_funding_rate_history_record, parse_index_price, parse_mark_price,
         parse_option_greeks, parse_orderbook_deltas, parse_orderbook_depth, parse_public_ws_data,
         parse_ticker_quote, parse_ticker_quote_from_rest, parse_trade_tick,
         parse_trade_tick_from_rest, ticker_channel, trades_channel,
@@ -104,8 +105,24 @@ pub struct DeriveDataClient {
     config: DeriveDataClientConfig,
     http_client: DeriveHttpClient,
     provider: DeriveInstrumentProvider,
-    ws_client: DeriveWebSocketClient,
+    ws_client: Arc<tokio::sync::Mutex<DeriveWebSocketClient>>,
+    ws_handle: DeriveWebSocketSubscriptionHandle,
+    ws_shutdown: DeriveWebSocketShutdownHandle,
     is_connected: Arc<AtomicBool>,
+    /// Set while REST market-data failover is the active data path because the
+    /// WebSocket is unavailable. Lets [`DataClient::is_connected`] report
+    /// readiness for live-node startup without claiming the WebSocket itself
+    /// is healthy; internal transport-health decisions (REST poll cadence,
+    /// quote acceptance) continue to read `is_connected` directly.
+    ///
+    /// Latched for the whole outage (cleared only by `disconnect`/`stop`/
+    /// `reset`), this also makes `connect()`'s top-of-function fast path
+    /// ("already connected, return") apply for the entire time the spawned
+    /// initial-reconnect retry task owns the WebSocket lifecycle, so a
+    /// repeated `connect()` call never races that task for the WebSocket
+    /// client's sole event receiver.
+    rest_failover_active: Arc<AtomicBool>,
+    ws_session_generation: Arc<AtomicU64>,
     cancellation_token: CancellationToken,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
@@ -116,6 +133,7 @@ pub struct DeriveDataClient {
     active_book_depth_channels: Arc<AtomicMap<InstrumentId, String>>,
     active_ticker_channels: Arc<AtomicMap<InstrumentId, String>>,
     active_quote_subs: Arc<AtomicSet<InstrumentId>>,
+    quote_poll_subs: Arc<Mutex<AHashMap<InstrumentId, u64>>>,
     active_trade_subs: Arc<AtomicSet<InstrumentId>>,
     active_mark_subs: Arc<AtomicSet<InstrumentId>>,
     active_index_subs: Arc<AtomicSet<InstrumentId>>,
@@ -124,6 +142,7 @@ pub struct DeriveDataClient {
     channel_subscriptions: Arc<ChannelSubscriptionRegistry>,
     subscription_lock: Arc<Mutex<()>>,
     quote_cache: Arc<Mutex<QuoteCache>>,
+    quote_feed_state: Arc<Mutex<AHashMap<InstrumentId, QuoteFeedState>>>,
     clock: &'static AtomicTime,
 }
 
@@ -134,6 +153,28 @@ impl DeriveDataClient {
     ///
     /// Returns an error when the HTTP client cannot be initialized.
     pub fn new(client_id: ClientId, config: DeriveDataClientConfig) -> anyhow::Result<Self> {
+        if config.rest_market_data_failover_enabled {
+            let poll_interval_ms = config
+                .rest_market_data_poll_interval_ms
+                .filter(|interval| *interval > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "REST market-data failover requires a non-zero polling interval"
+                    )
+                })?;
+            let max_quote_age_secs = config
+                .rest_market_data_max_quote_age_secs
+                .filter(|age| *age > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "REST market-data failover requires a non-zero maximum quote age"
+                    )
+                })?;
+            u64::try_from(Duration::from_secs(max_quote_age_secs).as_nanos())
+                .context("maximum REST quote age exceeds the supported duration")?;
+            let _ = poll_interval_ms;
+        }
+
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
         let proxy_url = config
@@ -167,6 +208,8 @@ impl DeriveDataClient {
             ws_client.set_request_timeout(Duration::from_secs(secs));
         }
 
+        let ws_handle = ws_client.subscription_handle();
+        let ws_shutdown = ws_client.shutdown_handle();
         let session_tasks = TaskGroup::new();
         let pending_tasks = TaskGroup::new();
 
@@ -175,8 +218,12 @@ impl DeriveDataClient {
             config,
             http_client,
             provider,
-            ws_client,
+            ws_client: Arc::new(tokio::sync::Mutex::new(ws_client)),
+            ws_handle,
+            ws_shutdown,
             is_connected: Arc::new(AtomicBool::new(false)),
+            rest_failover_active: Arc::new(AtomicBool::new(false)),
+            ws_session_generation: Arc::new(AtomicU64::new(0)),
             cancellation_token: CancellationToken::new(),
             session_tasks,
             pending_tasks,
@@ -187,6 +234,7 @@ impl DeriveDataClient {
             active_book_depth_channels: Arc::new(AtomicMap::new()),
             active_ticker_channels: Arc::new(AtomicMap::new()),
             active_quote_subs: Arc::new(AtomicSet::new()),
+            quote_poll_subs: Arc::new(Mutex::new(AHashMap::new())),
             active_trade_subs: Arc::new(AtomicSet::new()),
             active_mark_subs: Arc::new(AtomicSet::new()),
             active_index_subs: Arc::new(AtomicSet::new()),
@@ -195,6 +243,7 @@ impl DeriveDataClient {
             channel_subscriptions: Arc::new(ChannelSubscriptionRegistry::default()),
             subscription_lock: Arc::new(Mutex::new(())),
             quote_cache: Arc::new(Mutex::new(QuoteCache::new())),
+            quote_feed_state: Arc::new(Mutex::new(AHashMap::new())),
             clock,
         })
     }
@@ -222,7 +271,7 @@ impl DeriveDataClient {
 
     fn abort_session_tasks(&self) {
         self.session_tasks.begin_shutdown();
-        self.ws_client.begin_shutdown();
+        self.ws_shutdown.begin_shutdown();
     }
 
     /// Clears every local subscription map. Called from `disconnect` and
@@ -241,7 +290,9 @@ impl DeriveDataClient {
         self.active_index_subs.store(AHashSet::new());
         self.active_funding_subs.store(AHashSet::new());
         self.active_greeks_subs.store(AHashSet::new());
+        self.quote_feed_state.lock().clear();
         self.quote_cache.lock().clear();
+        self.quote_poll_subs.lock().clear();
     }
 
     async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
@@ -249,7 +300,7 @@ impl DeriveDataClient {
         self.abort_session_tasks();
         self.abort_pending_tasks();
 
-        if let Err(e) = self.ws_client.disconnect().await {
+        if let Err(e) = self.ws_client.lock().await.disconnect().await {
             self.shutdown_errors
                 .push(format!("Derive WebSocket shutdown failed: {e}"));
         }
@@ -258,6 +309,7 @@ impl DeriveDataClient {
         self.clear_subscription_state();
         self.channel_subscriptions.clear_transitions();
         self.is_connected.store(false, Ordering::Release);
+        self.rest_failover_active.store(false, Ordering::Release);
 
         if let Err(e) = session_result {
             self.shutdown_errors.push(e.to_string());
@@ -277,22 +329,7 @@ impl DeriveDataClient {
         &self,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>,
     ) -> anyhow::Result<()> {
-        let ctx = WsMessageContext {
-            clock: self.clock,
-            data_sender: self.data_sender.clone(),
-            instruments: Arc::clone(&self.instruments),
-            active_book_delta_channels: Arc::clone(&self.active_book_delta_channels),
-            active_book_depth_channels: Arc::clone(&self.active_book_depth_channels),
-            active_ticker_channels: Arc::clone(&self.active_ticker_channels),
-            active_quote_subs: Arc::clone(&self.active_quote_subs),
-            active_trade_subs: Arc::clone(&self.active_trade_subs),
-            active_mark_subs: Arc::clone(&self.active_mark_subs),
-            active_index_subs: Arc::clone(&self.active_index_subs),
-            active_funding_subs: Arc::clone(&self.active_funding_subs),
-            active_greeks_subs: Arc::clone(&self.active_greeks_subs),
-            subscription_lock: Arc::clone(&self.subscription_lock),
-            quote_cache: Arc::clone(&self.quote_cache),
-        };
+        let ctx = self.ws_message_context();
         let cancellation = self.cancellation_token.clone();
         let is_connected = Arc::clone(&self.is_connected);
 
@@ -304,6 +341,8 @@ impl DeriveDataClient {
                             Some(msg) => {
                                 if matches!(&msg, DeriveWsMessage::SessionRecoveryFailed(_)) {
                                     is_connected.store(false, Ordering::Release);
+                                } else if matches!(&msg, DeriveWsMessage::Reconnected) {
+                                    is_connected.store(true, Ordering::Release);
                                 }
                                 Self::handle_ws_message(msg, &ctx);
                             }
@@ -324,6 +363,29 @@ impl DeriveDataClient {
         Ok(())
     }
 
+    fn ws_message_context(&self) -> WsMessageContext {
+        WsMessageContext {
+            clock: self.clock,
+            data_sender: self.data_sender.clone(),
+            instruments: Arc::clone(&self.instruments),
+            active_book_delta_channels: Arc::clone(&self.active_book_delta_channels),
+            active_book_depth_channels: Arc::clone(&self.active_book_depth_channels),
+            active_ticker_channels: Arc::clone(&self.active_ticker_channels),
+            active_quote_subs: Arc::clone(&self.active_quote_subs),
+            active_trade_subs: Arc::clone(&self.active_trade_subs),
+            active_mark_subs: Arc::clone(&self.active_mark_subs),
+            active_index_subs: Arc::clone(&self.active_index_subs),
+            active_funding_subs: Arc::clone(&self.active_funding_subs),
+            active_greeks_subs: Arc::clone(&self.active_greeks_subs),
+            subscription_lock: Arc::clone(&self.subscription_lock),
+            quote_cache: Arc::clone(&self.quote_cache),
+            quote_feed_state: Arc::clone(&self.quote_feed_state),
+            ws_session_generation: Arc::clone(&self.ws_session_generation),
+            ws_subscription_handle: self.ws_handle.clone(),
+            max_quote_age_secs: self.config.rest_market_data_max_quote_age_secs,
+        }
+    }
+
     fn handle_ws_message(message: DeriveWsMessage, ctx: &WsMessageContext) {
         match message {
             DeriveWsMessage::Subscription(payload) => match parse_public_ws_data(&payload) {
@@ -341,6 +403,12 @@ impl DeriveDataClient {
             },
             DeriveWsMessage::Reconnected => {
                 let _guard = ctx.subscription_lock.lock();
+                ctx.ws_session_generation.fetch_add(1, Ordering::AcqRel);
+                for state in ctx.quote_feed_state.lock().values_mut() {
+                    state.last_ws_received = None;
+                    state.ws_subscription_confirmed = false;
+                    state.ws_epoch = None;
+                }
                 ctx.quote_cache.lock().clear();
                 log::info!("Derive WebSocket reconnected");
             }
@@ -448,6 +516,56 @@ impl DeriveDataClient {
                 let price_precision = instrument.price_precision();
 
                 if ctx.active_quote_subs.contains(&instrument_id) {
+                    let quote = match parse_ticker_quote(
+                        &msg,
+                        price_precision,
+                        instrument.size_precision(),
+                        ts_init,
+                    ) {
+                        Ok(quote) => quote,
+                        Err(e) => {
+                            log::warn!("Failed to parse Derive ticker quote: {e}");
+                            return;
+                        }
+                    };
+                    let current_epoch = ctx.ws_subscription_handle.connection_epoch();
+                    let mut feed_state = ctx.quote_feed_state.lock();
+                    let state = feed_state.entry(instrument_id).or_default();
+                    if state.ws_epoch != Some(current_epoch) {
+                        // Never confirmed, or confirmed under a now-stale
+                        // transport epoch (survived a reconnect). The prior
+                        // session's confirmation must not let a new-session
+                        // ticker through; re-establish it only from a
+                        // genuine current-epoch subscribe acknowledgement.
+                        state.ws_subscription_confirmed = false;
+                        state.ws_epoch = Some(current_epoch);
+                    }
+                    if !state.ws_subscription_confirmed
+                        && ctx
+                            .ws_subscription_handle
+                            .channel_confirmed_for_current_epoch(msg.channel.as_str())
+                    {
+                        state.ws_subscription_confirmed = true;
+                    }
+                    if !state.ws_subscription_confirmed {
+                        return;
+                    }
+                    if ctx.max_quote_age_secs.is_some()
+                        && !quote_is_fresh(quote.ts_event, ts_init, ctx.max_quote_age_secs)
+                    {
+                        log::debug!("Skipping stale Derive WebSocket quote for {instrument_id}");
+                        return;
+                    }
+                    if ctx.max_quote_age_secs.is_some()
+                        && state
+                            .last_published_event
+                            .is_some_and(|last_event| quote.ts_event <= last_event)
+                    {
+                        log::debug!(
+                            "Skipping non-monotonic Derive WebSocket quote for {instrument_id}"
+                        );
+                        return;
+                    }
                     let mut quote_cache = ctx.quote_cache.lock();
 
                     match process_ticker_quote(
@@ -457,7 +575,21 @@ impl DeriveDataClient {
                         ts_init,
                         &mut quote_cache,
                     ) {
-                        Ok(Some(quote)) => Self::send_data(ctx, Data::Quote(quote)),
+                        Ok(Some(quote)) => {
+                            if ctx.max_quote_age_secs.is_some() {
+                                state.last_published_event = Some(quote.ts_event);
+                                state.last_ws_received = Some(ts_init);
+                                if state.rest_polling {
+                                    let age_nanos =
+                                        ts_init.as_u64().saturating_sub(quote.ts_event.as_u64());
+                                    log::info!(
+                                        "Derive quote source changed to websocket for {instrument_id}; quote_age_ns={age_nanos}; reason=current_websocket_quote"
+                                    );
+                                    state.rest_polling = false;
+                                }
+                            }
+                            Self::send_data(ctx, Data::Quote(quote));
+                        }
                         Ok(None) => {}
                         Err(e) => log::warn!("Failed to parse Derive ticker quote: {e}"),
                     }
@@ -573,13 +705,16 @@ impl DeriveDataClient {
     }
 
     fn ws_handle(&self) -> DeriveWebSocketSubscriptionHandle {
-        self.ws_client.subscription_handle()
+        self.ws_handle.clone()
     }
 
     fn subscription_lifecycle(&self) -> SubscriptionLifecycle {
         SubscriptionLifecycle {
             registry: Arc::clone(&self.channel_subscriptions),
             lock: Arc::clone(&self.subscription_lock),
+            is_connected: Arc::clone(&self.is_connected),
+            ws_session_generation: Arc::clone(&self.ws_session_generation),
+            cancellation: self.cancellation_token.clone(),
             dispatch: SubscriptionDispatchState {
                 active_book_delta_channels: Arc::clone(&self.active_book_delta_channels),
                 active_book_depth_channels: Arc::clone(&self.active_book_depth_channels),
@@ -591,6 +726,7 @@ impl DeriveDataClient {
                 active_funding_subs: Arc::clone(&self.active_funding_subs),
                 active_greeks_subs: Arc::clone(&self.active_greeks_subs),
                 quote_cache: Arc::clone(&self.quote_cache),
+                quote_feed_state: Arc::clone(&self.quote_feed_state),
             },
         }
     }
@@ -624,10 +760,59 @@ impl DeriveDataClient {
         let Some(generation) = lifecycle.activate(owner, Some(&channel)) else {
             return Ok(());
         };
+        if feed == TickerFeed::Quote && self.config.rest_market_data_failover_enabled {
+            self.quote_poll_subs
+                .lock()
+                .insert(instrument_id, generation);
+        }
         let ws = self.ws_handle();
+        let quote_poll_subs = Arc::clone(&self.quote_poll_subs);
+        let quote_poll_subs_for_poll = Arc::clone(&quote_poll_subs);
         let http_client = self.http_client.clone();
         let include_expired = self.config.include_expired;
         let instruments = Arc::clone(&self.instruments);
+
+        if feed == TickerFeed::Quote && self.config.rest_market_data_failover_enabled {
+            let http_client = self.http_client.clone();
+            let instruments = Arc::clone(&self.instruments);
+            let quote_cache = Arc::clone(&self.quote_cache);
+            let quote_feed_state = Arc::clone(&self.quote_feed_state);
+            let subscription_lock = Arc::clone(&self.subscription_lock);
+            let sender = self.data_sender.clone();
+            let clock = self.clock;
+            let is_connected = Arc::clone(&self.is_connected);
+            let cancellation = self.cancellation_token.clone();
+            let ws_subscription_handle = ws.clone();
+            let poll_interval_ms = self
+                .config
+                .rest_market_data_poll_interval_ms
+                .expect("validated REST quote polling interval");
+            let max_quote_age_secs = self
+                .config
+                .rest_market_data_max_quote_age_secs
+                .expect("validated REST quote maximum age");
+
+            self.spawn_task("rest_market_data_failover", async move {
+                poll_rest_quotes(
+                    instrument_id,
+                    http_client,
+                    instruments,
+                    quote_cache,
+                    quote_feed_state,
+                    quote_poll_subs_for_poll,
+                    subscription_lock,
+                    generation,
+                    sender,
+                    clock,
+                    is_connected,
+                    ws_subscription_handle,
+                    cancellation,
+                    poll_interval_ms,
+                    max_quote_age_secs,
+                )
+                .await
+            });
+        }
 
         self.spawn_task("subscribe_ticker_feed", async move {
             if needs_load
@@ -640,11 +825,18 @@ impl DeriveDataClient {
                 .await
             {
                 lifecycle.rollback(owner, generation);
+                remove_quote_poll_generation(&quote_poll_subs, instrument_id, generation);
                 log::error!("Lazy-load failed for {instrument_id} ({label}): {e}");
                 return Ok(());
             }
 
-            run_channel_subscribe(lifecycle, owner, generation, request, ws).await
+            let subscribe_lifecycle = lifecycle.clone();
+            let result =
+                run_channel_subscribe(subscribe_lifecycle, owner, generation, request, ws).await;
+            if !lifecycle.is_current(owner, generation) {
+                remove_quote_poll_generation(&quote_poll_subs, instrument_id, generation);
+            }
+            result
         });
 
         Ok(())
@@ -693,6 +885,7 @@ impl DataClient for DeriveDataClient {
         self.abort_session_tasks();
         self.abort_pending_tasks();
         self.is_connected.store(false, Ordering::Relaxed);
+        self.rest_failover_active.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -703,6 +896,7 @@ impl DataClient for DeriveDataClient {
         self.abort_session_tasks();
         self.abort_pending_tasks();
         self.is_connected.store(false, Ordering::Relaxed);
+        self.rest_failover_active.store(false, Ordering::Relaxed);
 
         // Leave the cancellation token cancelled; connect() refreshes it
         // (and tears down the inner WS client) on the next lifecycle start.
@@ -719,6 +913,8 @@ impl DataClient for DeriveDataClient {
 
     fn is_connected(&self) -> bool {
         self.is_connected.load(Ordering::SeqCst)
+            || (self.config.rest_market_data_failover_enabled
+                && self.rest_failover_active.load(Ordering::SeqCst))
     }
 
     fn is_disconnected(&self) -> bool {
@@ -726,6 +922,14 @@ impl DataClient for DeriveDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        // While REST failover is the active path, `is_connected()` reports
+        // true (see above), so this also treats a `connect()` call made
+        // while the initial-reconnect retry task owns the WebSocket
+        // lifecycle as a no-op, rather than racing that task for the
+        // WebSocket client's sole event receiver (which could otherwise get
+        // the fast-path `Ok` right after the retry task takes the receiver,
+        // then `None` back, tearing down a session the retry task just
+        // recovered).
         if self.is_connected()
             && !self.cancellation_token.is_cancelled()
             && self.session_tasks.is_open()
@@ -749,7 +953,7 @@ impl DataClient for DeriveDataClient {
                 .map_err(|e| anyhow::anyhow!("Failed to start Derive data task generation: {e}"))?;
         }
         let cancellation_token = self.cancellation_token.clone();
-        let ws_shutdown = self.ws_client.shutdown_handle();
+        let ws_shutdown = self.ws_shutdown.clone();
         let setup_guard =
             TaskGroupGuard::new(&[&self.session_tasks, &self.pending_tasks], move || {
                 cancellation_token.cancel();
@@ -764,12 +968,84 @@ impl DataClient for DeriveDataClient {
             self.cache_provider_instruments();
         }
 
-        self.ws_client
-            .connect()
-            .await
-            .context("failed to connect Derive WebSocket")?;
+        let connect_result = self.ws_client.lock().await.connect().await;
+        if let Err(e) = connect_result {
+            if !self.config.rest_market_data_failover_enabled {
+                return Err(e).context("failed to connect Derive WebSocket");
+            }
+
+            let ws_client = Arc::clone(&self.ws_client);
+            let cancellation = self.cancellation_token.clone();
+            let is_connected = Arc::clone(&self.is_connected);
+            let ws_session_generation = Arc::clone(&self.ws_session_generation);
+            let ctx = self.ws_message_context();
+            self.spawn_task("derive_websocket_initial_reconnect", async move {
+                loop {
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+
+                    let mut client = ws_client.lock().await;
+                    let connect_result = tokio::select! {
+                        () = cancellation.cancelled() => return Ok(()),
+                        result = client.connect() => result,
+                    };
+                    match connect_result {
+                        Ok(()) => {
+                            let Some(mut rx) = client.take_event_receiver() else {
+                                anyhow::bail!("Derive WebSocket event receiver not initialized");
+                            };
+                            drop(client);
+                            is_connected.store(true, Ordering::Release);
+                            ws_session_generation.fetch_add(1, Ordering::AcqRel);
+
+                            loop {
+                                tokio::select! {
+                                    () = cancellation.cancelled() => return Ok(()),
+                                    maybe_msg = rx.recv() => match maybe_msg {
+                                        Some(msg) => {
+                                            if matches!(&msg, DeriveWsMessage::SessionRecoveryFailed(_)) {
+                                                is_connected.store(false, Ordering::Release);
+                                            } else if matches!(&msg, DeriveWsMessage::Reconnected) {
+                                                is_connected.store(true, Ordering::Release);
+                                            }
+                                            Self::handle_ws_message(msg, &ctx);
+                                        }
+                                        None => {
+                                            // The stream ended after a terminal
+                                            // recovery failure exhausted its
+                                            // retry budget. Keep owning
+                                            // reconnection: fall back to the
+                                            // outer loop and dial again rather
+                                            // than abandoning WebSocket
+                                            // recovery for the rest of the
+                                            // session.
+                                            is_connected.store(false, Ordering::Release);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            drop(client);
+                            log::warn!("Derive WebSocket initial reconnect failed: {e}");
+                        }
+                    }
+                }
+            });
+            self.is_connected.store(false, Ordering::Release);
+            self.rest_failover_active.store(true, Ordering::Release);
+            setup_guard.disarm();
+            log::warn!("Derive WebSocket unavailable; REST market-data failover remains active");
+            return Ok(());
+        }
+
         let session_result = self
             .ws_client
+            .lock()
+            .await
             .take_event_receiver()
             .ok_or_else(|| anyhow::anyhow!("Derive WebSocket event receiver not initialized"))
             .and_then(|rx| self.spawn_stream_task(rx));
@@ -784,6 +1060,7 @@ impl DataClient for DeriveDataClient {
         }
 
         self.is_connected.store(true, Ordering::Release);
+        self.ws_session_generation.fetch_add(1, Ordering::AcqRel);
         setup_guard.disarm();
         log::info!(
             "Connected Derive data client ({:?})",
@@ -1009,6 +1286,7 @@ impl DataClient for DeriveDataClient {
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        self.quote_poll_subs.lock().remove(&cmd.instrument_id);
         self.unsubscribe_channel_owner(ChannelOwner::Ticker {
             instrument_id: cmd.instrument_id,
             feed: TickerFeed::Quote,
@@ -1738,12 +2016,16 @@ struct SubscriptionDispatchState {
     active_funding_subs: Arc<AtomicSet<InstrumentId>>,
     active_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     quote_cache: Arc<Mutex<QuoteCache>>,
+    quote_feed_state: Arc<Mutex<AHashMap<InstrumentId, QuoteFeedState>>>,
 }
 
 #[derive(Debug, Clone)]
 struct SubscriptionLifecycle {
     registry: Arc<ChannelSubscriptionRegistry>,
     lock: Arc<Mutex<()>>,
+    is_connected: Arc<AtomicBool>,
+    ws_session_generation: Arc<AtomicU64>,
+    cancellation: CancellationToken,
     dispatch: SubscriptionDispatchState,
 }
 
@@ -1778,9 +2060,21 @@ async fn run_channel_subscribe(
     let transition = lifecycle.registry.transition(&channel);
     let _guard = transition.lock().await;
 
+    while !lifecycle.is_connected.load(Ordering::Acquire) {
+        if !lifecycle.is_current_channel(owner, generation, &channel) {
+            return Ok(());
+        }
+        tokio::select! {
+            () = lifecycle.cancellation.cancelled() => return Ok(()),
+            () = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+
     if !lifecycle.is_current_channel(owner, generation, &channel) || ws.has_subscription(&channel) {
         return Ok(());
     }
+
+    let session_generation = lifecycle.ws_session_generation.load(Ordering::Acquire);
 
     if let Err(e) = request.subscribe(&ws).await {
         lifecycle.rollback(owner, generation);
@@ -1806,6 +2100,22 @@ async fn run_channel_subscribe(
             );
         }
         return Ok(());
+    }
+
+    if matches!(
+        owner,
+        ChannelOwner::Ticker {
+            feed: TickerFeed::Quote,
+            ..
+        }
+    ) {
+        lifecycle.confirm_quote_subscription_if_current(
+            owner,
+            generation,
+            &channel,
+            session_generation,
+            ws.connection_epoch(),
+        );
     }
 
     if !lifecycle.has_owners(&channel)
@@ -1894,6 +2204,48 @@ impl SubscriptionLifecycle {
         let _guard = self.lock.lock();
         self.registry.state.lock().has_owners(channel)
     }
+
+    /// Atomically checks that `owner`'s channel ownership and the session
+    /// generation are still current, and if so records the quote
+    /// subscription as confirmed for `epoch`.
+    ///
+    /// The check and the write happen under one `self.lock` acquisition
+    /// (the same lock `Reconnected` holds while bumping the session
+    /// generation and clearing confirmation state), closing the gap where a
+    /// stale subscribe task could otherwise re-confirm a channel in between
+    /// a passed check and the write landing — after a concurrent
+    /// unsubscribe/resubscribe or reconnect already invalidated it.
+    fn confirm_quote_subscription_if_current(
+        &self,
+        owner: ChannelOwner,
+        generation: u64,
+        channel: &str,
+        session_generation_before_subscribe: u64,
+        epoch: u64,
+    ) -> bool {
+        let _guard = self.lock.lock();
+        if !self
+            .registry
+            .state
+            .lock()
+            .is_current_channel(owner, generation, channel)
+            || self.ws_session_generation.load(Ordering::Acquire)
+                != session_generation_before_subscribe
+        {
+            return false;
+        }
+        if let ChannelOwner::Ticker {
+            instrument_id,
+            feed: TickerFeed::Quote,
+        } = owner
+        {
+            let mut state = self.dispatch.quote_feed_state.lock();
+            let entry = state.entry(instrument_id).or_default();
+            entry.ws_subscription_confirmed = true;
+            entry.ws_epoch = Some(epoch);
+        }
+        true
+    }
 }
 
 impl SubscriptionDispatchState {
@@ -1920,6 +2272,12 @@ impl SubscriptionDispatchState {
                     channel.expect("ticker channel present").to_string(),
                 );
                 self.ticker_subscriptions(feed).insert(instrument_id);
+                if feed == TickerFeed::Quote {
+                    let mut feed_states = self.quote_feed_state.lock();
+                    let state = feed_states.entry(instrument_id).or_default();
+                    state.last_ws_received = None;
+                    state.ws_subscription_confirmed = false;
+                }
             }
             ChannelOwner::Trades(instrument_id) => {
                 self.active_trade_subs.insert(instrument_id);
@@ -1941,6 +2299,7 @@ impl SubscriptionDispatchState {
             } => {
                 self.ticker_subscriptions(feed).remove(&instrument_id);
                 if feed == TickerFeed::Quote {
+                    self.quote_feed_state.lock().remove(&instrument_id);
                     self.quote_cache.lock().remove(&instrument_id);
                 }
 
@@ -2271,6 +2630,196 @@ fn process_ticker_quote(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
+async fn poll_rest_quotes(
+    instrument_id: InstrumentId,
+    http_client: DeriveHttpClient,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    quote_cache: Arc<Mutex<QuoteCache>>,
+    quote_feed_state: Arc<Mutex<AHashMap<InstrumentId, QuoteFeedState>>>,
+    active_quote_subs: Arc<Mutex<AHashMap<InstrumentId, u64>>>,
+    subscription_lock: Arc<Mutex<()>>,
+    generation: u64,
+    sender: EventSender<DataEvent>,
+    clock: &'static AtomicTime,
+    is_connected: Arc<AtomicBool>,
+    ws_subscription_handle: DeriveWebSocketSubscriptionHandle,
+    cancellation: CancellationToken,
+    poll_interval_ms: u64,
+    max_quote_age_secs: u64,
+) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let max_age_nanos = Duration::from_secs(max_quote_age_secs).as_nanos() as u64;
+
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => return Ok(()),
+            _ = interval.tick() => {}
+        }
+
+        if !quote_poll_generation_is_current(&active_quote_subs, instrument_id, generation) {
+            return Ok(());
+        }
+
+        let now = clock.get_time_ns();
+        let current_epoch = ws_subscription_handle.connection_epoch();
+        let ws_is_current = quote_feed_state
+            .lock()
+            .get(&instrument_id)
+            .is_some_and(|state| {
+                is_connected.load(Ordering::Acquire)
+                    && state.ws_epoch == Some(current_epoch)
+                    && state.last_ws_received.is_some_and(|received| {
+                        now.as_u64() >= received.as_u64()
+                            && now.as_u64() - received.as_u64() <= max_age_nanos
+                    })
+            });
+        if ws_is_current {
+            continue;
+        }
+
+        let Some(instrument) = instruments.get_cloned(&instrument_id) else {
+            continue;
+        };
+        let instrument_name = match format_venue_symbol(&instrument_id) {
+            Ok(name) => name.to_string(),
+            Err(e) => {
+                log::warn!("Cannot poll Derive quote for {instrument_id}: {e}");
+                continue;
+            }
+        };
+
+        let poll_started = Instant::now();
+        let ticker = match http_client
+            .get_ticker_for_instrument(&instrument_name)
+            .await
+        {
+            Ok(ticker) => ticker,
+            Err(e) => {
+                log::warn!("Failed to poll Derive REST quote for {instrument_id}: {e}");
+                continue;
+            }
+        };
+        if !quote_poll_generation_is_current(&active_quote_subs, instrument_id, generation) {
+            return Ok(());
+        }
+        let ts_init = clock.get_time_ns();
+        let quote = match parse_ticker_quote_from_rest(
+            &ticker,
+            instrument.price_precision(),
+            instrument.size_precision(),
+            ts_init,
+        ) {
+            Ok(quote) => quote,
+            Err(e) => {
+                log::warn!("Failed to parse Derive REST quote for {instrument_id}: {e}");
+                continue;
+            }
+        };
+        if quote.instrument_id != instrument_id {
+            log::warn!("Skipping Derive REST quote with unexpected instrument for {instrument_id}");
+            continue;
+        }
+        if quote.bid_price.as_decimal() <= Decimal::ZERO
+            || quote.ask_price.as_decimal() <= Decimal::ZERO
+            || quote.bid_size.is_zero()
+            || quote.ask_size.is_zero()
+            || quote.bid_price >= quote.ask_price
+        {
+            log::warn!("Skipping invalid Derive REST quote for {instrument_id}");
+            continue;
+        }
+        if !quote_is_fresh(quote.ts_event, ts_init, Some(max_quote_age_secs)) {
+            log::debug!("Skipping stale or future Derive REST quote for {instrument_id}");
+            continue;
+        }
+
+        let _subscription_guard = subscription_lock.lock();
+        if !quote_poll_generation_is_current(&active_quote_subs, instrument_id, generation) {
+            return Ok(());
+        }
+        let mut feed_states = quote_feed_state.lock();
+        let now = clock.get_time_ns();
+        let current_epoch = ws_subscription_handle.connection_epoch();
+        let ws_is_current = feed_states.get(&instrument_id).is_some_and(|state| {
+            state.ws_subscription_confirmed
+                && state.ws_epoch == Some(current_epoch)
+                && is_connected.load(Ordering::Acquire)
+                && state.last_ws_received.is_some_and(|received| {
+                    now.as_u64() >= received.as_u64()
+                        && now.as_u64() - received.as_u64() <= max_age_nanos
+                })
+        });
+        if ws_is_current {
+            continue;
+        }
+        let state = feed_states.entry(instrument_id).or_default();
+        if state
+            .last_published_event
+            .is_some_and(|last_event| quote.ts_event <= last_event)
+        {
+            log::debug!("Skipping non-monotonic Derive REST quote for {instrument_id}");
+            continue;
+        }
+        let quote = match quote_cache.lock().process(
+            instrument_id,
+            Some(quote.bid_price),
+            Some(quote.ask_price),
+            Some(quote.bid_size),
+            Some(quote.ask_size),
+            quote.ts_event,
+            quote.ts_init,
+        ) {
+            Ok(quote) => quote,
+            Err(e) => {
+                log::warn!("Failed to construct Derive REST quote for {instrument_id}: {e}");
+                continue;
+            }
+        };
+
+        state.last_published_event = Some(quote.ts_event);
+        if !state.rest_polling {
+            let age_nanos = ts_init.as_u64().saturating_sub(quote.ts_event.as_u64());
+            let poll_latency_ms = poll_started.elapsed().as_millis();
+            log::info!(
+                "Derive quote source changed to rest_polling for {instrument_id}; quote_age_ns={age_nanos}; poll_latency_ms={poll_latency_ms}; reason=websocket_quote_stale"
+            );
+            state.rest_polling = true;
+        }
+        if let Err(e) = sender.send(DataEvent::Data(Data::Quote(quote))) {
+            log::error!("Failed to publish Derive REST quote for {instrument_id}: {e}");
+        }
+    }
+}
+
+fn quote_poll_generation_is_current(
+    generations: &Arc<Mutex<AHashMap<InstrumentId, u64>>>,
+    instrument_id: InstrumentId,
+    generation: u64,
+) -> bool {
+    generations.lock().get(&instrument_id) == Some(&generation)
+}
+
+fn remove_quote_poll_generation(
+    generations: &Arc<Mutex<AHashMap<InstrumentId, u64>>>,
+    instrument_id: InstrumentId,
+    generation: u64,
+) {
+    let mut generations = generations.lock();
+    if generations.get(&instrument_id) == Some(&generation) {
+        generations.remove(&instrument_id);
+    }
+}
+
+fn quote_is_fresh(ts_event: UnixNanos, ts_now: UnixNanos, max_quote_age_secs: Option<u64>) -> bool {
+    let Some(max_age_secs) = max_quote_age_secs else {
+        return true;
+    };
+    let max_age_nanos = Duration::from_secs(max_age_secs).as_nanos() as u64;
+    ts_event.as_u64() <= ts_now.as_u64() && ts_now.as_u64() - ts_event.as_u64() <= max_age_nanos
+}
+
 fn quote_side(price: Price, size: Quantity) -> (Option<Price>, Option<Quantity>) {
     if price.is_zero() || size.is_zero() {
         (None, None)
@@ -2517,9 +3066,25 @@ mod tests {
     ) {
         let (data_sender, data_rx) = tokio::sync::mpsc::unbounded_channel();
         let instruments = Arc::new(AtomicMap::new());
+        let quote_feed_state = Arc::new(Mutex::new(AHashMap::new()));
         if let Some(instrument) = instrument {
+            quote_feed_state
+                .lock()
+                .entry(instrument.id())
+                .or_insert_with(|| QuoteFeedState {
+                    ws_subscription_confirmed: true,
+                    // Matches a freshly constructed (never reconnected) WS
+                    // client's initial connection epoch (0), so this
+                    // pre-confirmed state is epoch-consistent rather than
+                    // immediately fenced as stale by the epoch check in
+                    // `handle_public_ws_data`.
+                    ws_epoch: Some(0),
+                    ..QuoteFeedState::default()
+                });
             cache_instrument(&instruments, &instrument);
         }
+        let ws_client =
+            DeriveWebSocketClient::new(None, DeriveEnvironment::Mainnet, Default::default(), None);
 
         (
             WsMessageContext {
@@ -2537,6 +3102,10 @@ mod tests {
                 active_greeks_subs: Arc::new(AtomicSet::new()),
                 subscription_lock: Arc::new(Mutex::new(())),
                 quote_cache: Arc::new(Mutex::new(QuoteCache::new())),
+                quote_feed_state,
+                ws_session_generation: Arc::new(AtomicU64::new(0)),
+                ws_subscription_handle: ws_client.subscription_handle(),
+                max_quote_age_secs: None,
             },
             data_rx,
         )

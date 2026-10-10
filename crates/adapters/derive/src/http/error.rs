@@ -108,6 +108,16 @@ impl DeriveHttpError {
     pub fn is_transport_error(&self) -> bool {
         matches!(self, Self::Transport(_))
     }
+
+    /// Returns whether a private write may have reached the venue without a
+    /// definitive JSON-RPC result.
+    #[must_use]
+    pub fn is_ambiguous_write_outcome(&self) -> bool {
+        !matches!(
+            self,
+            Self::JsonRpc { .. } | Self::MissingCredentials { .. } | Self::Auth(_)
+        )
+    }
 }
 
 impl From<HttpClientError> for DeriveHttpError {
@@ -159,5 +169,20 @@ mod tests {
         let upstream = HttpClientError::Error("boom".to_string());
         let mapped: DeriveHttpError = upstream.into();
         assert!(mapped.is_transport_error());
+    }
+
+    #[rstest]
+    fn test_write_outcome_is_ambiguous_without_definitive_jsonrpc_result() {
+        assert!(DeriveHttpError::transport("connection reset").is_ambiguous_write_outcome());
+        assert!(DeriveHttpError::decode("invalid response").is_ambiguous_write_outcome());
+        assert!(DeriveHttpError::http(503, "service unavailable").is_ambiguous_write_outcome());
+        assert!(
+            !DeriveHttpError::JsonRpc {
+                code: -32602,
+                message: "invalid params".to_string(),
+                data: None,
+            }
+            .is_ambiguous_write_outcome()
+        );
     }
 }

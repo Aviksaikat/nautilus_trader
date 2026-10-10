@@ -64,6 +64,13 @@ pub struct DeriveDataClientConfig {
     /// WebSocket request.
     #[builder(default = true)]
     pub auto_load_missing_instruments: bool,
+    /// Whether REST polling may temporarily replace stale quote WebSocket data.
+    #[builder(default)]
+    pub rest_market_data_failover_enabled: bool,
+    /// REST quote polling interval in milliseconds. Required when failover is enabled.
+    pub rest_market_data_poll_interval_ms: Option<u64>,
+    /// Maximum accepted REST quote age in seconds. Required when failover is enabled.
+    pub rest_market_data_max_quote_age_secs: Option<u64>,
     /// WebSocket transport backend (defaults to `Sockudo` when that feature is enabled).
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -80,6 +87,9 @@ nautilus_core::impl_pyo3_config_getters!(DeriveDataClientConfig {
     currencies: Vec<String>,
     include_expired: bool,
     auto_load_missing_instruments: bool,
+    rest_market_data_failover_enabled: bool,
+    rest_market_data_poll_interval_ms: Option<u64>,
+    rest_market_data_max_quote_age_secs: Option<u64>,
     transport_backend: TransportBackend,
 });
 
@@ -200,6 +210,17 @@ pub struct DeriveExecutionClientConfig {
     /// `max_matching_requests_per_second`, which never inflates it. See
     /// <https://docs.derive.xyz/reference/rate-limits>.
     pub max_per_instrument_matching_requests_per_second: Option<u32>,
+    /// Enables signed REST order writes and private-state polling while the
+    /// execution WebSocket is unavailable or unauthenticated.
+    #[builder(default)]
+    pub rest_fallback_enabled: bool,
+    /// Interval in seconds between private-state reconciliations while REST
+    /// fallback is active. Required when `rest_fallback_enabled` is true.
+    pub private_state_poll_interval_secs: Option<u64>,
+    /// Maximum age in seconds of the last successful private-state
+    /// reconciliation for allowing risk-increasing orders. Required when
+    /// `rest_fallback_enabled` is true.
+    pub max_account_state_age_secs: Option<u64>,
 }
 
 #[cfg(feature = "python")]
@@ -223,6 +244,9 @@ nautilus_core::impl_pyo3_config_getters!(DeriveExecutionClientConfig {
     market_order_slippage_bps: u32,
     max_matching_requests_per_second: Option<u32>,
     max_per_instrument_matching_requests_per_second: Option<u32>,
+    rest_fallback_enabled: bool,
+    private_state_poll_interval_secs: Option<u64>,
+    max_account_state_age_secs: Option<u64>,
     transport_backend: TransportBackend,
 });
 
@@ -270,6 +294,26 @@ impl DeriveExecutionClientConfig {
         if max_fee_per_contract <= Decimal::ZERO {
             anyhow::bail!("max_fee_per_contract must be greater than zero");
         }
+
+        if self.rest_fallback_enabled {
+            let Some(interval) = self.private_state_poll_interval_secs else {
+                anyhow::bail!(
+                    "private_state_poll_interval_secs is required when REST fallback is enabled"
+                );
+            };
+            if interval == 0 {
+                anyhow::bail!("private_state_poll_interval_secs must be greater than zero");
+            }
+
+            let Some(max_age) = self.max_account_state_age_secs else {
+                anyhow::bail!(
+                    "max_account_state_age_secs is required when REST fallback is enabled"
+                );
+            };
+            if max_age == 0 {
+                anyhow::bail!("max_account_state_age_secs must be greater than zero");
+            }
+        }
         Ok(())
     }
 
@@ -306,6 +350,9 @@ mod tests {
         assert!(config.currencies.is_empty());
         assert!(!config.include_expired);
         assert!(config.auto_load_missing_instruments);
+        assert!(!config.rest_market_data_failover_enabled);
+        assert!(config.rest_market_data_poll_interval_ms.is_none());
+        assert!(config.rest_market_data_max_quote_age_secs.is_none());
     }
 
     #[rstest]
@@ -337,6 +384,9 @@ mod tests {
                 .max_per_instrument_matching_requests_per_second
                 .is_none()
         );
+        assert!(!config.rest_fallback_enabled);
+        assert!(config.private_state_poll_interval_secs.is_none());
+        assert!(config.max_account_state_age_secs.is_none());
         assert!(!config.has_credentials());
     }
 

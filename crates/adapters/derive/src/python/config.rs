@@ -43,6 +43,9 @@ impl DeriveDataClientConfig {
         include_expired = None,
         auto_load_missing_instruments = None,
         transport_backend = None,
+        rest_market_data_failover_enabled = None,
+        rest_market_data_poll_interval_ms = None,
+        rest_market_data_max_quote_age_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -57,6 +60,9 @@ impl DeriveDataClientConfig {
         include_expired: Option<bool>,
         auto_load_missing_instruments: Option<bool>,
         transport_backend: Option<TransportBackend>,
+        rest_market_data_failover_enabled: Option<bool>,
+        rest_market_data_poll_interval_ms: Option<u64>,
+        rest_market_data_max_quote_age_secs: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -72,6 +78,10 @@ impl DeriveDataClientConfig {
             include_expired: include_expired.unwrap_or(defaults.include_expired),
             auto_load_missing_instruments: auto_load_missing_instruments
                 .unwrap_or(defaults.auto_load_missing_instruments),
+            rest_market_data_failover_enabled: rest_market_data_failover_enabled
+                .unwrap_or(defaults.rest_market_data_failover_enabled),
+            rest_market_data_poll_interval_ms,
+            rest_market_data_max_quote_age_secs,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
@@ -114,6 +124,9 @@ impl DeriveExecutionClientConfig {
         max_matching_requests_per_second = None,
         max_per_instrument_matching_requests_per_second = None,
         transport_backend = None,
+        rest_fallback_enabled = None,
+        private_state_poll_interval_secs = None,
+        max_account_state_age_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -139,6 +152,9 @@ impl DeriveExecutionClientConfig {
         max_matching_requests_per_second: Option<u32>,
         max_per_instrument_matching_requests_per_second: Option<u32>,
         transport_backend: Option<TransportBackend>,
+        rest_fallback_enabled: Option<bool>,
+        private_state_poll_interval_secs: Option<u64>,
+        max_account_state_age_secs: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -166,6 +182,9 @@ impl DeriveExecutionClientConfig {
                 .unwrap_or(defaults.market_order_slippage_bps),
             max_matching_requests_per_second,
             max_per_instrument_matching_requests_per_second,
+            rest_fallback_enabled: rest_fallback_enabled.unwrap_or(defaults.rest_fallback_enabled),
+            private_state_poll_interval_secs,
+            max_account_state_age_secs,
         }
     }
 

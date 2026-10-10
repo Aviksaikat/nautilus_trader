@@ -195,6 +195,14 @@ async fn handle_tickers(
     handle("/public/get_tickers", state, headers, body).await
 }
 
+async fn handle_ticker(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    handle("/public/get_ticker", state, headers, body).await
+}
+
 async fn handle_health() -> impl IntoResponse {
     StatusCode::OK
 }
@@ -216,6 +224,7 @@ async fn start_mock_server(state: TestServerState) -> SocketAddr {
             post(handle_tradingview_chart_data),
         )
         .route("/public/get_tickers", post(handle_tickers))
+        .route("/public/get_ticker", post(handle_ticker))
         .route("/private/order", post(handle_order))
         .route("/private/cancel_by_label", post(handle_cancel_by_label))
         .route("/health", axum::routing::get(handle_health))
@@ -649,29 +658,54 @@ async fn test_get_candles_posts_instrument_and_window() {
 }
 
 #[rstest]
+#[case::option("ETH-20260627-3500-C", "options/http_ticker_eth_snapshot.json", true)]
+#[case::perp("ETH-PERP", "perps/http_ticker_eth_snapshot.json", false)]
+#[case::spot("ETH-USDC", "perps/http_ticker_eth_snapshot.json", false)]
+#[tokio::test]
+async fn test_get_ticker_uses_instrument_specific_endpoint(
+    #[case] instrument_name: &str,
+    #[case] fixture_path: &str,
+    #[case] expect_option_pricing: bool,
+) {
+    let state = TestServerState::with_success_response();
+    let mut ticker = load_json(fixture_path);
+    ticker["instrument_name"] = json!(instrument_name);
+    *state.response_body.lock().await = json!({"id": 1, "result": ticker});
+    let addr = start_mock_server(state.clone()).await;
+
+    let client = DeriveHttpClient::new(base_url(addr), Some(5), None, None).unwrap();
+    let ticker = client
+        .get_ticker_for_instrument(instrument_name)
+        .await
+        .unwrap();
+
+    let captured = state.captured().await;
+    assert_eq!(captured.path, "/public/get_ticker");
+    assert_eq!(captured.body, json!({"instrument_name": instrument_name}));
+    assert_eq!(ticker.instrument_name, instrument_name);
+    if expect_option_pricing {
+        let pricing = ticker.option_pricing.expect("option ticker has pricing");
+        assert_eq!(pricing.forward_price.to_string(), "3505");
+    } else {
+        assert!(ticker.option_pricing.is_none());
+    }
+}
+
+#[rstest]
 #[case::option(
     "ETH-20260627-3500-C",
     "options/http_ticker_eth_snapshot.json",
     "option",
     "ETH",
-    Some("20260627"),
-    true
+    Some("20260627")
 )]
-#[case::perp(
-    "ETH-PERP",
-    "perps/http_ticker_eth_snapshot.json",
-    "perp",
-    "ETH",
-    None,
-    false
-)]
+#[case::perp("ETH-PERP", "perps/http_ticker_eth_snapshot.json", "perp", "ETH", None)]
 #[case::spot(
     "ETH-USDC",
     "perps/http_ticker_eth_snapshot.json",
     "erc20",
     "ETH",
-    None,
-    false
+    None
 )]
 #[tokio::test]
 async fn test_get_ticker_uses_get_tickers_and_selects_instrument(
@@ -680,7 +714,6 @@ async fn test_get_ticker_uses_get_tickers_and_selects_instrument(
     #[case] instrument_type: &str,
     #[case] currency: &str,
     #[case] expiry_date: Option<&str>,
-    #[case] expect_option_pricing: bool,
 ) {
     let state = TestServerState::with_success_response();
     *state.response_body.lock().await = json!({
@@ -707,12 +740,6 @@ async fn test_get_ticker_uses_get_tickers_and_selects_instrument(
     assert_eq!(captured.path, "/public/get_tickers");
     assert_eq!(captured.body, Value::Object(expected_body));
     assert_eq!(ticker.instrument_name, instrument_name);
-    if expect_option_pricing {
-        let pricing = ticker.option_pricing.expect("option ticker has pricing");
-        assert_eq!(pricing.forward_price.to_string(), "3505");
-    } else {
-        assert!(ticker.option_pricing.is_none());
-    }
 }
 
 #[rstest]

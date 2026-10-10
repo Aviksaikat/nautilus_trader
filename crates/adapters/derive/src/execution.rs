@@ -26,7 +26,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -55,7 +55,7 @@ use nautilus_core::{
 use nautilus_live::{
     ExecutionClientCore, ExecutionEventEmitter, SocketControl,
     execution::reports::retain_order_status_reports,
-    task::{TaskGroup, TaskGroupGuard},
+    task::{TaskGroup, TaskGroupGuard, TaskSpawner},
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -72,6 +72,7 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Price, Quantity},
 };
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
@@ -80,6 +81,7 @@ use crate::{
     common::{
         consts::{
             DERIVE_ACCOUNT_REGISTRATION_TIMEOUT_SECS, DERIVE_VENUE, MIN_SIGNATURE_TTL,
+            RECONNECT_BACKOFF_FACTOR, RECONNECT_BASE_BACKOFF, RECONNECT_MAX_BACKOFF,
             TRIGGER_ORDER_SIGNATURE_TTL,
         },
         credential::DeriveCredential,
@@ -113,6 +115,7 @@ use crate::{
         context::{SigningContext, resolve_signing_context},
         nonce::{NonceError, NonceManager},
     },
+    websocket::client::DeriveWebSocketShutdownHandle,
     websocket::{
         DeriveOrdersSubscriptionData, DeriveTradesSubscriptionData, DeriveWebSocketClient,
         DeriveWsChannel, DeriveWsCredentials, DeriveWsError, DeriveWsExecutionHandle,
@@ -136,12 +139,14 @@ pub struct DeriveExecutionClient {
     credential: DeriveCredential,
     emitter: ExecutionEventEmitter,
     http_client: DeriveHttpClient,
-    ws_client: DeriveWebSocketClient,
+    ws_client: Arc<tokio::sync::Mutex<DeriveWebSocketClient>>,
+    ws_shutdown: DeriveWebSocketShutdownHandle,
     ws_exec: DeriveWsExecutionHandle,
     instruments: Arc<AtomicMap<InstrumentId, DeriveInstrument>>,
     nonce_manager: Arc<NonceManager>,
     signing: SigningContext,
     is_connected: Arc<AtomicBool>,
+    rest_execution_state: Arc<RestExecutionState>,
     cancellation_token: CancellationToken,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
@@ -227,6 +232,8 @@ impl DeriveExecutionClient {
         // The handle shares the client's command channel, which survives the
         // reconnect swap, so it stays valid for the client's lifetime.
         let ws_exec = ws_client.execution_handle();
+        let ws_shutdown = ws_client.shutdown_handle();
+        let ws_client = Arc::new(tokio::sync::Mutex::new(ws_client));
 
         let signing = resolve_signing_context(&credential, &config)?;
 
@@ -250,11 +257,13 @@ impl DeriveExecutionClient {
             emitter,
             http_client,
             ws_client,
+            ws_shutdown,
             ws_exec,
             instruments: Arc::new(AtomicMap::new()),
             nonce_manager: Arc::new(NonceManager::new()),
             signing,
             is_connected: Arc::new(AtomicBool::new(false)),
+            rest_execution_state: Arc::new(RestExecutionState::default()),
             cancellation_token: CancellationToken::new(),
             session_tasks,
             pending_tasks,
@@ -321,7 +330,7 @@ impl DeriveExecutionClient {
 
     fn abort_session_tasks(&self) {
         self.session_tasks.begin_shutdown();
-        self.ws_client.begin_shutdown();
+        self.ws_shutdown.begin_shutdown();
     }
 
     async fn await_pending_tasks(&self) -> anyhow::Result<()> {
@@ -363,7 +372,86 @@ impl DeriveExecutionClient {
             subaccount_id: self.credential.subaccount_id(),
             clock: self.clock,
             dispatch_state: Arc::clone(&self.dispatch_state),
+            rest_execution_state: Arc::clone(&self.rest_execution_state),
+            is_connected: Arc::clone(&self.is_connected),
         }
+    }
+
+    fn start_rest_reconciliation_loop(&self) -> anyhow::Result<()> {
+        if !self.config.rest_fallback_enabled {
+            return Ok(());
+        }
+        let interval_secs = self
+            .config
+            .private_state_poll_interval_secs
+            .expect("validated REST fallback polling interval");
+        let interval = Duration::from_secs(interval_secs);
+        let context = self.reconciliation_context();
+        let ws_exec = self.ws_exec.clone();
+        let cancellation = self.cancellation_token.clone();
+        let rest_execution_state = Arc::clone(&self.rest_execution_state);
+
+        self.session_tasks.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if !ws_exec.is_authenticated() {
+                            rest_execution_state.active.store(true, Ordering::Release);
+                            rest_execution_state.websocket_ready.store(false, Ordering::Release);
+                        }
+                        if rest_execution_state.active.load(Ordering::Acquire)
+                            && let Err(e) = context.reconcile_private_state().await
+                        {
+                            rest_execution_state
+                                .reconciliation_failed
+                                .store(true, Ordering::Release);
+                            log::warn!("Derive REST-mode private reconciliation failed: {e:?}");
+                        } else if rest_execution_state.active.load(Ordering::Acquire)
+                            && rest_execution_state.websocket_ready.load(Ordering::Acquire)
+                            && rest_execution_state.unresolved_orders.lock().is_empty()
+                        {
+                            rest_execution_state.active.store(false, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    fn should_use_rest_fallback(&self) -> bool {
+        self.config.rest_fallback_enabled
+            && (self.rest_execution_state.active.load(Ordering::Acquire)
+                || !self.ws_exec.is_authenticated())
+    }
+
+    fn rest_entry_gate_open(&self) -> bool {
+        let Some(max_age_secs) = self.config.max_account_state_age_secs else {
+            return false;
+        };
+        let last_reconciliation_ns = self
+            .rest_execution_state
+            .last_private_reconciliation_ns
+            .load(Ordering::Acquire);
+        let now_ns = self.clock.get_time_ns().as_u64();
+        let max_age_ns = max_age_secs.saturating_mul(1_000_000_000);
+
+        last_reconciliation_ns > 0
+            && now_ns.saturating_sub(last_reconciliation_ns) <= max_age_ns
+            && !self
+                .rest_execution_state
+                .reconciliation_failed
+                .load(Ordering::Acquire)
+            && self
+                .rest_execution_state
+                .unresolved_orders
+                .lock()
+                .is_empty()
     }
 
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
@@ -414,7 +502,7 @@ impl DeriveExecutionClient {
         self.abort_session_tasks();
         self.abort_pending_tasks();
 
-        if let Err(e) = self.ws_client.disconnect().await {
+        if let Err(e) = self.ws_client.lock().await.disconnect().await {
             self.shutdown_errors
                 .push(format!("Derive WebSocket shutdown failed: {e}"));
         }
@@ -441,82 +529,202 @@ impl DeriveExecutionClient {
         &self,
         rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>,
     ) -> anyhow::Result<()> {
-        let emitter = self.emitter.clone();
-        let account_id = self.core.account_id;
-        let clock = self.clock;
-        let cancellation = self.cancellation_token.clone();
-        let dispatch_state = self.dispatch_state.clone();
-        let reconciliation = self.reconciliation_context();
-        let is_connected = Arc::clone(&self.is_connected);
         let session_spawner = self
             .session_tasks
             .spawner()
             .map_err(|e| anyhow::anyhow!("Derive session task admission is closed: {e}"))?;
+        spawn_ws_dispatch(
+            &session_spawner,
+            rx,
+            self.emitter.clone(),
+            self.core.account_id,
+            self.clock,
+            Arc::clone(&self.dispatch_state),
+            self.reconciliation_context(),
+            Arc::clone(&self.is_connected),
+            self.cancellation_token.clone(),
+            self.config.rest_fallback_enabled,
+        )
+    }
+
+    fn start_initial_ws_retry_loop(&self, channels: Vec<DeriveWsChannel>) -> anyhow::Result<()> {
+        let session_spawner = self
+            .session_tasks
+            .spawner()
+            .map_err(|e| anyhow::anyhow!("Derive session task admission is closed: {e}"))?;
+        let ws_client = Arc::clone(&self.ws_client);
+        let context = self.reconciliation_context();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+        let clock = self.clock;
+        let dispatch_state = Arc::clone(&self.dispatch_state);
+        let is_connected = Arc::clone(&self.is_connected);
+        let cancellation = self.cancellation_token.clone();
+        let rest_fallback_enabled = self.config.rest_fallback_enabled;
 
         self.session_tasks.spawn(async move {
-            let mut rx = rx;
-
+            let mut retry_delay = RECONNECT_BASE_BACKOFF;
             loop {
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break,
-                    maybe = rx.recv() => {
-                        match maybe {
-                            Some(DeriveWsMessage::Reconnected) => {
-                                let context = reconciliation.clone();
-                                let task_cancellation = cancellation.clone();
+                    () = tokio::time::sleep(retry_delay) => {}
+                }
 
-                                if let Err(e) = session_spawner.spawn(async move {
-                                    tokio::select! {
-                                        () = task_cancellation.cancelled() => {}
-                                        result = context.recover_after_reconnect() => {
-                                            if let Err(e) = result {
-                                                log::warn!("Derive post-reconnect recovery failed: {e:?}");
-                                            }
-                                        }
-                                    }
-                                }) {
-                                    log::warn!("Skipping Derive reconnect recovery after shutdown began: {e}");
+                let receiver = {
+                    let mut client = ws_client.lock().await;
+                    match client.connect().await {
+                        Ok(()) => match client.subscribe_channels(channels.clone()).await {
+                            Ok(()) => client.take_event_receiver(),
+                            Err(e) => {
+                                log::warn!("Derive startup WebSocket subscription failed: {e}");
+                                if let Err(disconnect_error) = client.disconnect().await {
+                                    log::warn!("Failed to reset Derive WebSocket after subscription failure: {disconnect_error}");
                                 }
+                                None
                             }
-                            Some(DeriveWsMessage::SessionRecoveryFailed(reason)) => {
-                                is_connected.store(false, Ordering::Release);
-                                log::error!("Derive execution WebSocket recovery failed: {reason}");
-                            }
-                            Some(DeriveWsMessage::Subscription(payload))
-                                if payload.channel.ends_with(".balances") =>
-                            {
-                                let context = reconciliation.clone();
-                                let task_cancellation = cancellation.clone();
-
-                                if let Err(e) = session_spawner.spawn(async move {
-                                    tokio::select! {
-                                        () = task_cancellation.cancelled() => {}
-                                        result = context.refresh_account_state() => {
-                                            if let Err(e) = result {
-                                                log::warn!("Derive balance update refresh failed: {e:?}");
-                                            }
-                                        }
-                                    }
-                                }) {
-                                    log::warn!("Skipping Derive account refresh after shutdown began: {e}");
-                                }
-                            }
-                            Some(message) => handle_ws_message(
-                                message,
-                                &emitter,
-                                account_id,
-                                clock,
-                                &dispatch_state,
-                            ),
-                            None => break,
+                        },
+                        Err(e) => {
+                            log::warn!("Derive startup WebSocket retry failed: {e}");
+                            None
                         }
                     }
+                };
+
+                let Some(receiver) = receiver else {
+                    retry_delay = retry_delay
+                        .mul_f64(RECONNECT_BACKOFF_FACTOR)
+                        .min(RECONNECT_MAX_BACKOFF);
+                    continue;
+                };
+
+                if let Err(e) = spawn_ws_dispatch(
+                    &session_spawner,
+                    receiver,
+                    emitter.clone(),
+                    account_id,
+                    clock,
+                    Arc::clone(&dispatch_state),
+                    context.clone(),
+                    Arc::clone(&is_connected),
+                    cancellation.clone(),
+                    rest_fallback_enabled,
+                ) {
+                    log::warn!("Failed to start Derive WebSocket dispatch after retry: {e}");
+                    let _ = ws_client.lock().await.disconnect().await;
+                    retry_delay = retry_delay
+                        .mul_f64(RECONNECT_BACKOFF_FACTOR)
+                        .min(RECONNECT_MAX_BACKOFF);
+                    continue;
                 }
+
+                context
+                    .rest_execution_state
+                    .websocket_ready
+                    .store(true, Ordering::Release);
+                if let Err(e) = context.recover_after_reconnect().await {
+                    log::warn!("Derive startup recovery after WebSocket retry failed: {e:?}");
+                }
+                break;
             }
         })?;
         Ok(())
     }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn spawn_ws_dispatch(
+    session_spawner: &TaskSpawner,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>,
+    emitter: ExecutionEventEmitter,
+    account_id: AccountId,
+    clock: &'static AtomicTime,
+    dispatch_state: Arc<WsDispatchState>,
+    reconciliation: DeriveReconciliationContext,
+    is_connected: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+    rest_fallback_enabled: bool,
+) -> anyhow::Result<()> {
+    let child_spawner = session_spawner.clone();
+    session_spawner.spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(DeriveWsMessage::Reconnected) => {
+                            reconciliation
+                                .rest_execution_state
+                                .active
+                                .store(true, Ordering::Release);
+                            reconciliation
+                                .rest_execution_state
+                                .websocket_ready
+                                .store(true, Ordering::Release);
+                            let context = reconciliation.clone();
+                            let task_cancellation = cancellation.clone();
+
+                            if let Err(e) = child_spawner.spawn(async move {
+                                tokio::select! {
+                                    () = task_cancellation.cancelled() => {}
+                                    result = context.recover_after_reconnect() => {
+                                        if let Err(e) = result {
+                                            log::warn!("Derive post-reconnect recovery failed: {e:?}");
+                                        }
+                                    }
+                                }
+                            }) {
+                                log::warn!("Skipping Derive reconnect recovery after shutdown began: {e}");
+                            }
+                        }
+                        Some(DeriveWsMessage::SessionRecoveryFailed(reason)) => {
+                            reconciliation
+                                .rest_execution_state
+                                .active
+                                .store(true, Ordering::Release);
+                            reconciliation
+                                .rest_execution_state
+                                .websocket_ready
+                                .store(false, Ordering::Release);
+                            if !rest_fallback_enabled {
+                                is_connected.store(false, Ordering::Release);
+                            }
+                            log::error!("Derive execution WebSocket recovery failed: {reason}");
+                        }
+                        Some(DeriveWsMessage::Subscription(payload))
+                            if payload.channel.ends_with(".balances") =>
+                        {
+                            let context = reconciliation.clone();
+                            let task_cancellation = cancellation.clone();
+
+                            if let Err(e) = child_spawner.spawn(async move {
+                                tokio::select! {
+                                    () = task_cancellation.cancelled() => {}
+                                    result = context.refresh_account_state() => {
+                                        if let Err(e) = result {
+                                            log::warn!("Derive balance update refresh failed: {e:?}");
+                                        }
+                                    }
+                                }
+                            }) {
+                                log::warn!("Skipping Derive account refresh after shutdown began: {e}");
+                            }
+                        }
+                        Some(message) => handle_ws_message(
+                            message,
+                            &emitter,
+                            account_id,
+                            clock,
+                            &dispatch_state,
+                        ),
+                        None => break,
+                    }
+                }
+            }
+        }
+    })?;
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -609,7 +817,7 @@ impl ExecutionClient for DeriveExecutionClient {
             self.cancellation_token = CancellationToken::new();
         }
         let cancellation_token = self.cancellation_token.clone();
-        let ws_shutdown = self.ws_client.shutdown_handle();
+        let ws_shutdown = self.ws_shutdown.clone();
         let setup_guard =
             TaskGroupGuard::new(&[&self.session_tasks, &self.pending_tasks], move || {
                 cancellation_token.cancel();
@@ -620,11 +828,45 @@ impl ExecutionClient for DeriveExecutionClient {
             .await
             .context("failed to initialize Derive instruments")?;
 
-        self.ws_client
-            .connect()
-            .await
-            .context("failed to connect Derive WebSocket")?;
-        let Some(rx) = self.ws_client.take_event_receiver() else {
+        let channels = vec![
+            DeriveWsChannel::orders(self.credential.subaccount_id()),
+            DeriveWsChannel::private_trades(self.credential.subaccount_id()),
+            DeriveWsChannel::balances(self.credential.subaccount_id()),
+        ];
+        let ws_connect_result = { self.ws_client.lock().await.connect().await };
+        if let Err(e) = ws_connect_result {
+            if !self.config.rest_fallback_enabled || !matches!(e, DeriveWsError::Transport(_)) {
+                self.teardown_partial_connect().await?;
+                return Err(anyhow::Error::new(e).context("failed to connect Derive WebSocket"));
+            }
+
+            log::warn!("Derive WebSocket is unavailable at startup; entering REST fallback: {e}");
+            self.rest_execution_state
+                .active
+                .store(true, Ordering::Release);
+            self.reconciliation_context()
+                .reconcile_private_state()
+                .await
+                .context("failed initial Derive REST private-state reconciliation")?;
+            if let Err(e) = self
+                .await_account_registered(DERIVE_ACCOUNT_REGISTRATION_TIMEOUT_SECS)
+                .await
+            {
+                self.teardown_partial_connect().await?;
+                return Err(e.context("failed waiting for Derive REST account registration"));
+            }
+            self.start_rest_reconciliation_loop()
+                .context("failed to start Derive REST reconciliation task")?;
+            self.start_initial_ws_retry_loop(channels)
+                .context("failed to start Derive WebSocket startup retry task")?;
+
+            self.core.set_connected();
+            self.is_connected.store(true, Ordering::Release);
+            setup_guard.disarm();
+            return Ok(());
+        }
+
+        let Some(rx) = self.ws_client.lock().await.take_event_receiver() else {
             let e = anyhow::anyhow!("Derive execution WS event receiver not initialized");
             if let Err(teardown_error) = self.teardown_partial_connect().await {
                 return Err(e.context(format!(
@@ -634,14 +876,14 @@ impl ExecutionClient for DeriveExecutionClient {
             return Err(e);
         };
 
-        let subaccount_id = self.credential.subaccount_id();
-        let channels = vec![
-            DeriveWsChannel::orders(subaccount_id),
-            DeriveWsChannel::private_trades(subaccount_id),
-            DeriveWsChannel::balances(subaccount_id),
-        ];
-
-        if let Err(e) = self.ws_client.subscribe_channels(channels).await {
+        let subscribe_result = {
+            self.ws_client
+                .lock()
+                .await
+                .subscribe_channels(channels)
+                .await
+        };
+        if let Err(e) = subscribe_result {
             log::warn!("Derive private WS subscriptions failed: {e}; tearing down");
             if let Err(teardown_error) = self.teardown_partial_connect().await {
                 return Err(anyhow::Error::new(e).context(format!(
@@ -659,6 +901,9 @@ impl ExecutionClient for DeriveExecutionClient {
             }
             return Err(e.context("failed to register Derive execution WebSocket dispatch task"));
         }
+
+        self.start_rest_reconciliation_loop()
+            .context("failed to start Derive REST reconciliation task")?;
 
         // Fail-fast if the initial account snapshot cannot load: without it,
         // `await_account_registered` would block the full timeout window and
@@ -689,6 +934,21 @@ impl ExecutionClient for DeriveExecutionClient {
 
         self.core.set_connected();
         self.is_connected.store(true, Ordering::Release);
+        let recovery_pending = self
+            .rest_execution_state
+            .reconciliation_failed
+            .load(Ordering::Acquire)
+            || !self
+                .rest_execution_state
+                .unresolved_orders
+                .lock()
+                .is_empty();
+        self.rest_execution_state
+            .active
+            .store(recovery_pending, Ordering::Release);
+        self.rest_execution_state
+            .websocket_ready
+            .store(true, Ordering::Release);
         setup_guard.disarm();
         log::info!(
             "Connected Derive execution client ({:?})",
@@ -804,6 +1064,21 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(());
         }
 
+        let use_rest_fallback = self.should_use_rest_fallback();
+        if use_rest_fallback {
+            let reason = if is_trigger_order {
+                Some("Derive trigger order submission is unsupported during REST fallback")
+            } else if !self.rest_entry_gate_open() {
+                Some("Derive REST fallback is waiting for fresh, fully reconciled private state")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.emitter.emit_order_denied(&order, reason);
+                return Ok(());
+            }
+        }
+
         // Spot has no position to reduce; the venue rejects reduce-only
         // unconditionally (11025), so deny locally. Perp/option reduce-only is
         // position-conditional and must still reach the venue.
@@ -863,11 +1138,14 @@ impl ExecutionClient for DeriveExecutionClient {
         };
         self.dispatch_state
             .register_identity(order.client_order_id(), identity);
+        let rest_execution_state = Arc::clone(&self.rest_execution_state);
 
         self.emitter.emit_order_submitted(&order);
 
         let slippage_bps = self.signing.market_order_slippage_bps;
         let dispatch_state = self.dispatch_state.clone();
+        let rest_http_client = http_client.clone();
+        let max_account_state_age_secs = self.config.max_account_state_age_secs;
 
         self.spawn_task("submit_order", async move {
             let instrument = match cached_or_fetch_instrument(
@@ -997,33 +1275,37 @@ impl ExecutionClient for DeriveExecutionClient {
                 None
             };
 
-            let matching_reservation = match ws_exec
-                .reserve_matching_request(
-                    if is_trigger_order {
-                        "private/trigger_order"
-                    } else {
-                        "private/order"
-                    },
-                    &instrument.instrument_name,
-                )
-                .await
-            {
-                Ok(reservation) => reservation,
-                Err(e) => {
-                    let (reason, due_post_only) = ws_rejection_reason(&e);
-                    log::warn!(
-                        "Cannot reserve Derive order quota for {}: {reason}",
-                        order_for_task.client_order_id(),
-                    );
-                    dispatch_state.forget(&order_for_task.client_order_id());
-                    let ts = clock.get_time_ns();
-                    emitter.emit_order_rejected(
-                        &order_for_task,
-                        &reason,
-                        ts,
-                        due_post_only,
-                    );
-                    return Ok(());
+            let matching_reservation = if use_rest_fallback {
+                None
+            } else {
+                match ws_exec
+                    .reserve_matching_request(
+                        if is_trigger_order {
+                            "private/trigger_order"
+                        } else {
+                            "private/order"
+                        },
+                        &instrument.instrument_name,
+                    )
+                    .await
+                {
+                    Ok(reservation) => Some(reservation),
+                    Err(e) => {
+                        let (reason, due_post_only) = ws_rejection_reason(&e);
+                        log::warn!(
+                            "Cannot reserve Derive order quota for {}: {reason}",
+                            order_for_task.client_order_id(),
+                        );
+                        dispatch_state.forget(&order_for_task.client_order_id());
+                        let ts = clock.get_time_ns();
+                        emitter.emit_order_rejected(
+                            &order_for_task,
+                            &reason,
+                            ts,
+                            due_post_only,
+                        );
+                        return Ok(());
+                    }
                 }
             };
 
@@ -1088,7 +1370,10 @@ impl ExecutionClient for DeriveExecutionClient {
                 );
 
                 match ws_exec
-                    .submit_trigger_order_after_rate_limit(&payload, matching_reservation)
+                    .submit_trigger_order_after_rate_limit(
+                        &payload,
+                        matching_reservation.expect("trigger orders use WebSocket mode"),
+                    )
                     .await
                 {
                     Ok(order) => {
@@ -1209,10 +1494,73 @@ impl ExecutionClient for DeriveExecutionClient {
                 payload.limit_price,
             );
 
+            if use_rest_fallback {
+                if !reserve_rest_entry(
+                    &rest_execution_state,
+                    order_for_task.client_order_id(),
+                    clock.get_time_ns().as_u64(),
+                    max_account_state_age_secs,
+                    false,
+                ) {
+                    let reason = "Derive REST fallback is waiting for fresh, fully reconciled private state";
+                    dispatch_state.forget(&order_for_task.client_order_id());
+                    emitter.emit_order_rejected(&order_for_task, reason, clock.get_time_ns(), false);
+                    return Ok(());
+                }
+                match rest_http_client.submit_order(&payload).await {
+                    Ok(submitted_order) => {
+                        let venue_order_id = VenueOrderId::new(submitted_order.order_id.as_str());
+                        dispatch_state.record_venue_order_id(
+                            order_for_task.client_order_id(),
+                            venue_order_id,
+                        );
+                        rest_execution_state
+                            .unresolved_orders
+                            .lock()
+                            .remove(&order_for_task.client_order_id());
+                        let ts_now = clock.get_time_ns();
+                        ensure_accepted_emitted(
+                            &emitter,
+                            &dispatch_state,
+                            order_for_task.client_order_id(),
+                            identity,
+                            venue_order_id,
+                            account_id,
+                            ts_now,
+                            ts_now,
+                        );
+                    }
+                    Err(e) if e.is_ambiguous_write_outcome() => {
+                        log::warn!(
+                            "Derive REST submit for {} returned ambiguous outcome: {e}; awaiting reconciliation",
+                            order_for_task.client_order_id(),
+                        );
+                    }
+                    Err(e) => {
+                        rest_execution_state
+                            .unresolved_orders
+                            .lock()
+                            .remove(&order_for_task.client_order_id());
+                        dispatch_state.forget(&order_for_task.client_order_id());
+                        let ts = clock.get_time_ns();
+                        emitter.emit_order_rejected(
+                            &order_for_task,
+                            &e.to_string(),
+                            ts,
+                            false,
+                        );
+                    }
+                }
+                return Ok(());
+            }
+
             // Discard the result (and any `trades` it carries): fills arrive on
             // the `.trades` channel and are deduped by trade id.
             match ws_exec
-                .submit_order_after_rate_limit(&payload, matching_reservation)
+                .submit_order_after_rate_limit(
+                    &payload,
+                    matching_reservation.expect("WS submit reserves matching quota"),
+                )
                 .await
             {
                 Ok(_) => {
@@ -1262,6 +1610,7 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        let use_rest_fallback = self.should_use_rest_fallback();
         let http_client = self.http_client.clone();
         let ws_exec = self.ws_exec.clone();
         let subaccount_id = self.credential.subaccount_id();
@@ -1279,8 +1628,85 @@ impl ExecutionClient for DeriveExecutionClient {
             .cache()
             .order(&client_order_id)
             .is_some_and(|order| is_derive_trigger_order_type(order.order_type()));
+        let is_resolved_open_order = self
+            .core
+            .cache()
+            .order(&client_order_id)
+            .is_some_and(|order| !order.is_closed() && order.venue_order_id() == venue_order_id);
+
+        if use_rest_fallback {
+            let reason = if is_trigger_order {
+                Some("Derive trigger-order cancellation is unsupported during REST fallback")
+            } else if venue_order_id.is_none() {
+                Some("Derive REST cancellation requires a resolved venue_order_id")
+            } else if !is_resolved_open_order {
+                Some(
+                    "Derive REST cancellation requires a currently open order with matching venue state",
+                )
+            } else if self
+                .rest_execution_state
+                .unresolved_orders
+                .lock()
+                .contains_key(&client_order_id)
+            {
+                Some(
+                    "Derive REST cancellation cannot proceed while this order outcome is unresolved",
+                )
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.emitter.emit_order_cancel_rejected_event(
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    venue_order_id,
+                    reason,
+                    clock.get_time_ns(),
+                );
+                return Ok(());
+            }
+            self.rest_execution_state
+                .unresolved_orders
+                .lock()
+                .insert(client_order_id, true);
+        }
+        let rest_execution_state = Arc::clone(&self.rest_execution_state);
 
         self.spawn_task("cancel_order", async move {
+            if use_rest_fallback {
+                let resolved_venue_order_id = venue_order_id.expect("validated above");
+                match http_client
+                    .cancel_order(&DeriveCancelParams::new(
+                        subaccount_id,
+                        venue_symbol.as_str(),
+                        resolved_venue_order_id.as_str(),
+                    ))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) if e.is_ambiguous_write_outcome() => {
+                        log::warn!(
+                            "Derive REST cancel for {client_order_id} returned ambiguous outcome: {e}; awaiting reconciliation",
+                        );
+                    }
+                    Err(e) => {
+                        rest_execution_state
+                            .unresolved_orders
+                            .lock()
+                            .remove(&client_order_id);
+                        emitter.emit_order_cancel_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            Some(resolved_venue_order_id),
+                            &e.to_string(),
+                            clock.get_time_ns(),
+                        );
+                    }
+                }
+                return Ok(());
+            }
             let outcome = match venue_order_id {
                 Some(venue_order_id) if is_trigger_order => {
                     ws_exec
@@ -1425,6 +1851,7 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        let use_rest_fallback = self.should_use_rest_fallback();
         let venue_symbol = format_venue_symbol(&cmd.instrument_id)?.to_string();
         let side_filter = cmd.order_side;
         let cache = self.core.cache();
@@ -1443,6 +1870,19 @@ impl ExecutionClient for DeriveExecutionClient {
                 continue;
             }
 
+            if use_rest_fallback {
+                let reason = "Derive cancel_all_orders is unsupported during REST fallback; cancel resolved orders individually";
+                self.emitter.emit_order_cancel_rejected_event(
+                    order.strategy_id(),
+                    cmd.instrument_id,
+                    client_order_id,
+                    order.venue_order_id(),
+                    reason,
+                    self.clock.get_time_ns(),
+                );
+                continue;
+            }
+
             let is_trigger = is_derive_trigger_order_type(order.order_type());
             if side_filter.is_none() && !is_trigger {
                 continue;
@@ -1458,6 +1898,10 @@ impl ExecutionClient for DeriveExecutionClient {
             cancels.push((venue_order_id, is_trigger));
         }
         drop(cache);
+
+        if use_rest_fallback {
+            return Ok(());
+        }
 
         if side_filter.is_some() && cancels.is_empty() {
             return Ok(());
@@ -1523,6 +1967,7 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        let use_rest_fallback = self.should_use_rest_fallback();
         let ts_now = self.clock.get_time_ns();
 
         let Some(venue_order_id) = cmd.venue_order_id else {
@@ -1567,11 +2012,33 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(());
         }
 
+        if use_rest_fallback {
+            let reason = if order.venue_order_id() != Some(venue_order_id) {
+                Some("Derive REST replace requires the current resolved venue_order_id")
+            } else if !self.rest_entry_gate_open() {
+                Some("Derive REST fallback is waiting for fresh, fully reconciled private state")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.emitter.emit_order_modify_rejected_event(
+                    cmd.strategy_id,
+                    cmd.instrument_id,
+                    cmd.client_order_id,
+                    Some(venue_order_id),
+                    reason,
+                    ts_now,
+                );
+                return Ok(());
+            }
+        }
+
         let target_quantity = cmd.quantity.unwrap_or_else(|| order.quantity());
         let target_price = cmd.price.or_else(|| order.price());
 
         let venue_symbol = format_venue_symbol(&cmd.instrument_id)?.to_string();
         let http_client = self.http_client.clone();
+        let rest_http_client = http_client.clone();
         let ws_exec = self.ws_exec.clone();
         let signing = self.signing.clone();
         let nonce_manager = self.nonce_manager.clone();
@@ -1587,6 +2054,8 @@ impl ExecutionClient for DeriveExecutionClient {
         let stale_venue_order_id = venue_order_id;
         let account_id = self.core.account_id;
         let voi_str = venue_order_id.to_string();
+        let rest_execution_state = Arc::clone(&self.rest_execution_state);
+        let max_account_state_age_secs = self.config.max_account_state_age_secs;
 
         self.spawn_task("modify_order", async move {
             let instrument = match cached_or_fetch_instrument(
@@ -1614,24 +2083,28 @@ impl ExecutionClient for DeriveExecutionClient {
                 }
             };
 
-            let matching_reservation = match ws_exec
-                .reserve_matching_request("private/replace", &instrument.instrument_name)
-                .await
-            {
-                Ok(reservation) => reservation,
-                Err(e) => {
-                    let (reason, _) = ws_rejection_reason(&e);
-                    log::warn!("Cannot reserve Derive replace quota for {client_order_id}: {reason}");
-                    let ts = clock.get_time_ns();
-                    emitter.emit_order_modify_rejected_event(
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
-                        Some(stale_venue_order_id),
-                        &reason,
-                        ts,
-                    );
-                    return Ok(());
+            let matching_reservation = if use_rest_fallback {
+                None
+            } else {
+                match ws_exec
+                    .reserve_matching_request("private/replace", &instrument.instrument_name)
+                    .await
+                {
+                    Ok(reservation) => Some(reservation),
+                    Err(e) => {
+                        let (reason, _) = ws_rejection_reason(&e);
+                        log::warn!("Cannot reserve Derive replace quota for {client_order_id}: {reason}");
+                        let ts = clock.get_time_ns();
+                        emitter.emit_order_modify_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            Some(stale_venue_order_id),
+                            &reason,
+                            ts,
+                        );
+                        return Ok(());
+                    }
                 }
             };
 
@@ -1698,20 +2171,61 @@ impl ExecutionClient for DeriveExecutionClient {
                 }
             };
 
+            if use_rest_fallback
+                && !reserve_rest_entry(
+                    &rest_execution_state,
+                    client_order_id,
+                    clock.get_time_ns().as_u64(),
+                    max_account_state_age_secs,
+                    true,
+                )
+            {
+                let reason = "Derive REST fallback is waiting for fresh, fully reconciled private state";
+                let ts = clock.get_time_ns();
+                emitter.emit_order_modify_rejected_event(
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    Some(stale_venue_order_id),
+                    reason,
+                    ts,
+                );
+                return Ok(());
+            }
+
             // Mark before sending so the cancel-of-old leg is suppressed even if
             // it arrives before this response.
             dispatch_state.mark_pending_modify(client_order_id, stale_venue_order_id);
 
-            let outcome = ws_exec
-                .modify_order_after_rate_limit(&payload, matching_reservation)
-                .await;
+            let (outcome, ambiguous_outcome) = if use_rest_fallback {
+                match rest_http_client.replace_order(&payload).await {
+                    Ok(outcome) => (Ok(outcome), false),
+                    Err(e) => {
+                        let ambiguous = e.is_ambiguous_write_outcome();
+                        (Err(e.to_string()), ambiguous)
+                    }
+                }
+            } else {
+                match ws_exec
+                    .modify_order_after_rate_limit(
+                        &payload,
+                        matching_reservation.expect("WS replace reserves matching quota"),
+                    )
+                    .await
+                {
+                    Ok(outcome) => (Ok(outcome), false),
+                    Err(e) => {
+                        let ambiguous = is_write_outcome_ambiguous_ws(&e);
+                        let (reason, _) = ws_rejection_reason(&e);
+                        (Err(reason), ambiguous)
+                    }
+                }
+            };
 
-            if let Err(e) = &outcome
-                && is_write_outcome_ambiguous_ws(e)
-            {
+            if outcome.is_err() && ambiguous_outcome {
                 dispatch_state.clear_pending_modify(&client_order_id);
                 log::warn!(
-                    "Derive modify for {client_order_id} returned ambiguous WS outcome: {e}; awaiting reconciliation",
+                    "Derive modify for {client_order_id} returned ambiguous outcome; awaiting reconciliation",
                 );
                 return Ok(());
             }
@@ -1728,12 +2242,19 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::debug!(
                             "Skipping private/replace response event for {client_order_id}: an incoming terminal frame already resolved the modify",
                         );
+                        if use_rest_fallback {
+                            rest_execution_state
+                                .unresolved_orders
+                                .lock()
+                                .remove(&client_order_id);
+                        }
                         return Ok(());
                     }
                     log::debug!(
                         "Order replaced: client_order_id={client_order_id}, new venue_order_id={new_voi}",
                     );
                     let ts = clock.get_time_ns();
+                    rest_execution_state.unresolved_orders.lock().remove(&client_order_id);
                     emitter.emit_order_updated(
                         &order_for_task,
                         new_voi,
@@ -1756,6 +2277,12 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::debug!(
                             "Skipping partial private/replace response for {client_order_id}: an incoming terminal frame already resolved the modify",
                         );
+                        if use_rest_fallback {
+                            rest_execution_state
+                                .unresolved_orders
+                                .lock()
+                                .remove(&client_order_id);
+                        }
                         return Ok(());
                     }
 
@@ -1782,6 +2309,7 @@ impl ExecutionClient for DeriveExecutionClient {
                         ts,
                         ts,
                     );
+                    rest_execution_state.unresolved_orders.lock().remove(&client_order_id);
                     dispatch_state.forget(&client_order_id);
                 }
                 Err(e) => {
@@ -1795,7 +2323,10 @@ impl ExecutionClient for DeriveExecutionClient {
                         );
                         return Ok(());
                     }
-                    let (reason, _) = ws_rejection_reason(&e);
+                    let reason = e;
+                    if use_rest_fallback {
+                        rest_execution_state.unresolved_orders.lock().remove(&client_order_id);
+                    }
                     log::debug!("Derive rejected modify for {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
                     emitter.emit_order_modify_rejected_event(
@@ -1870,6 +2401,39 @@ impl ExecutionClient for DeriveExecutionClient {
     }
 }
 
+#[derive(Debug, Default)]
+struct RestExecutionState {
+    active: AtomicBool,
+    websocket_ready: AtomicBool,
+    reconciliation_failed: AtomicBool,
+    last_private_reconciliation_ns: AtomicU64,
+    unresolved_orders: Mutex<AHashMap<ClientOrderId, bool>>,
+}
+
+fn reserve_rest_entry(
+    state: &RestExecutionState,
+    client_order_id: ClientOrderId,
+    now_ns: u64,
+    max_age_secs: Option<u64>,
+    requires_terminal: bool,
+) -> bool {
+    let Some(max_age_secs) = max_age_secs else {
+        return false;
+    };
+    let mut unresolved = state.unresolved_orders.lock();
+    let last_reconciliation_ns = state.last_private_reconciliation_ns.load(Ordering::Acquire);
+    let max_age_ns = max_age_secs.saturating_mul(1_000_000_000);
+    if last_reconciliation_ns == 0
+        || now_ns.saturating_sub(last_reconciliation_ns) > max_age_ns
+        || state.reconciliation_failed.load(Ordering::Acquire)
+        || !unresolved.is_empty()
+    {
+        return false;
+    }
+    unresolved.insert(client_order_id, requires_terminal);
+    true
+}
+
 #[derive(Clone)]
 struct DeriveReconciliationContext {
     http_client: DeriveHttpClient,
@@ -1879,6 +2443,8 @@ struct DeriveReconciliationContext {
     subaccount_id: u64,
     clock: &'static AtomicTime,
     dispatch_state: Arc<WsDispatchState>,
+    rest_execution_state: Arc<RestExecutionState>,
+    is_connected: Arc<AtomicBool>,
 }
 
 impl DeriveReconciliationContext {
@@ -1897,15 +2463,57 @@ impl DeriveReconciliationContext {
     }
 
     async fn recover_after_reconnect(&self) -> anyhow::Result<()> {
+        if let Err(e) = self.reconcile_private_state().await {
+            self.rest_execution_state
+                .reconciliation_failed
+                .store(true, Ordering::Release);
+            return Err(e);
+        }
+        if !self
+            .rest_execution_state
+            .unresolved_orders
+            .lock()
+            .is_empty()
+        {
+            anyhow::bail!("Derive REST recovery still has unresolved order outcomes");
+        }
+        self.is_connected.store(true, Ordering::Release);
+        self.rest_execution_state
+            .active
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn reconcile_private_state(&self) -> anyhow::Result<()> {
         self.refresh_account_state().await?;
         let mass_status = Box::pin(self.generate_mass_status(None)).await?;
         let order_count = mass_status.order_reports().len();
         let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
         let position_count = mass_status.position_reports().len();
+        {
+            let mut unresolved = self.rest_execution_state.unresolved_orders.lock();
+            for (_, report) in mass_status.order_reports() {
+                if let Some(client_order_id) = report.client_order_id
+                    && unresolved
+                        .get(&client_order_id)
+                        .is_some_and(|requires_terminal| {
+                            !requires_terminal || report.order_status.is_closed()
+                        })
+                {
+                    unresolved.remove(&client_order_id);
+                }
+            }
+        }
         self.emitter
             .send_execution_report(ExecutionReport::MassStatus(Box::new(mass_status)));
+        self.rest_execution_state
+            .last_private_reconciliation_ns
+            .store(self.clock.get_time_ns().as_u64(), Ordering::Release);
+        self.rest_execution_state
+            .reconciliation_failed
+            .store(false, Ordering::Release);
         log::info!(
-            "Derive post-reconnect reconciliation submitted: orders={order_count}, fills={fill_count}, positions={position_count}",
+            "Derive private reconciliation submitted: orders={order_count}, fills={fill_count}, positions={position_count}",
         );
         Ok(())
     }

@@ -44,6 +44,12 @@ class DeriveDataClientConfig:
     @property
     def auto_load_missing_instruments(self) -> bool: ...
     @property
+    def rest_market_data_failover_enabled(self) -> bool: ...
+    @property
+    def rest_market_data_poll_interval_ms(self) -> int | None: ...
+    @property
+    def rest_market_data_max_quote_age_secs(self) -> int | None: ...
+    @property
     def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
@@ -58,6 +64,9 @@ class DeriveDataClientConfig:
         include_expired: bool | None = None,
         auto_load_missing_instruments: bool | None = None,
         transport_backend: network.TransportBackend | None = None,
+        rest_market_data_failover_enabled: bool | None = None,
+        rest_market_data_poll_interval_ms: int | None = None,
+        rest_market_data_max_quote_age_secs: int | None = None,
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...
@@ -108,6 +117,12 @@ class DeriveExecutionClientConfig:
     @property
     def max_per_instrument_matching_requests_per_second(self) -> int | None: ...
     @property
+    def rest_fallback_enabled(self) -> bool: ...
+    @property
+    def private_state_poll_interval_secs(self) -> int | None: ...
+    @property
+    def max_account_state_age_secs(self) -> int | None: ...
+    @property
     def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
@@ -132,6 +147,9 @@ class DeriveExecutionClientConfig:
         market_order_slippage_bps: int | None = None,
         max_matching_requests_per_second: int | None = None,
         max_per_instrument_matching_requests_per_second: int | None = None,
+        rest_fallback_enabled: bool | None = None,
+        private_state_poll_interval_secs: int | None = None,
+        max_account_state_age_secs: int | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
     @property
