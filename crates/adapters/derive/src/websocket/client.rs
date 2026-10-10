@@ -1017,7 +1017,7 @@ impl DeriveWebSocketSubscriptionHandle {
     /// low-level connection epoch. Callers that cache their own "is this
     /// confirmation/evidence still current" state (e.g. the data client's
     /// per-instrument quote feed state) must key on this full identity, not
-    /// on [`Self::connection_epoch`] alone — a rebuilt transport's epoch
+    /// on [`Self::connection_epoch`] alone - a rebuilt transport's epoch
     /// restarts at the same values an earlier, now-dead transport used.
     pub(crate) fn current_session_epoch(&self) -> SessionEpoch {
         SessionEpoch {
@@ -2769,7 +2769,7 @@ mod tests {
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
         assert!(
             result.is_ok(),
-            "an accepting before_send must not change today's behaviour, was {result:?}",
+            "an accepting before_send must not change today's behavior, was {result:?}",
         );
     }
 }

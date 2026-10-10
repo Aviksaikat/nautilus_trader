@@ -256,8 +256,8 @@ pub struct DeriveExecutionClientConfig {
     pub max_account_state_age_secs: Option<u64>,
     /// Maximum age in seconds of the quote used for market-order pricing and
     /// the risk-increasing entry/replace gate while REST fallback is active.
-    /// Independent of the data client's `rest_market_data_max_quote_age_secs`
-    /// — execution must honor its own bound rather than assume data's is at
+    /// Independent of the data client's `rest_market_data_max_quote_age_secs` -
+    /// execution must honor its own bound rather than assume data's is at
     /// least as strict. Required when `rest_fallback_enabled` is true.
     pub max_quote_age_secs: Option<u64>,
 }

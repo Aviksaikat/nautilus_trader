@@ -635,7 +635,7 @@ async fn start_rest_server(state: RestState) -> SocketAddr {
 async fn handle_ws_upgrade(ws: WebSocketUpgrade, State(state): State<WsState>) -> Response {
     if state
         .initial_handshake_failures
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
             remaining.checked_sub(1)
         })
         .is_ok()
@@ -1589,7 +1589,7 @@ async fn rest_fallback_client(
 async fn test_ambiguous_websocket_write_blocks_the_next_rest_entry() {
     // The routing decision is taken before the write. When the socket dies in
     // between, the possibly-live WebSocket order must still register as
-    // unresolved, or the next command — now routed through REST — passes the
+    // unresolved, or the next command - now routed through REST - passes the
     // entry gate while that order may be working.
     let rest_state = RestState::default();
     let ws_state = WsState::default();
@@ -2064,7 +2064,7 @@ async fn test_ambiguous_replace_resolves_but_entries_wait_for_the_replacement_to
 async fn test_in_flight_write_is_never_released_by_empty_reconciliations() {
     // A request held at the venue can still land. Complete reads that show no
     // trace of it prove nothing, so it must keep blocking entries until its own
-    // response arrives — and then be applied exactly once.
+    // response arrives - and then be applied exactly once.
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let mut tc = rest_fallback_client(&rest_state, &ws_state, |mut config| {
@@ -2455,7 +2455,7 @@ async fn test_ambiguous_write_on_a_healthy_socket_halts_the_next_websocket_entry
 
 #[rstest]
 #[tokio::test]
-async fn test_healthy_start_then_exhausted_recovery_is_redialled_by_the_supervisor() {
+async fn test_healthy_start_then_exhausted_recovery_is_redialed_by_the_supervisor() {
     // One supervisor covers both startup routes. A healthy start parks it; a
     // later terminal session failure must still get a fresh dial, or the client
     // sits in REST mode for the rest of the process while reporting connected.
@@ -2757,7 +2757,7 @@ async fn test_client_error_submit_is_definitive_and_does_not_halt_the_next_entry
 async fn test_an_old_partial_fill_does_not_resolve_an_ambiguous_cancel() {
     // A full-history read keeps returning fills from before the command. A
     // partial fill on the targeted order is not evidence that its cancellation
-    // took effect — the remainder can still be live.
+    // took effect - the remainder can still be live.
     let rest_state = RestState::default();
     let label = "STRAT-REST-PARTIAL-FILL-CANCEL";
     let target = "ord-rest-partial-fill-target";
@@ -2926,7 +2926,7 @@ async fn test_reported_exposure_absent_from_the_cache_keeps_the_generation_unapp
 async fn test_two_sleeves_summing_to_the_reported_position_are_applied() {
     // The venue reports one net position per instrument while the cache splits
     // it across strategy sleeves. Two sleeves of 0.03 must satisfy a reported
-    // 0.06 — comparing each sleeve against the account total would deny every
+    // 0.06 - comparing each sleeve against the account total would deny every
     // entry on a correctly reconciled two-sleeve deployment.
     let rest_state = RestState::default();
     *rest_state.positions_response.lock().await = json!({
@@ -3123,8 +3123,8 @@ async fn test_feature_off_recovery_restores_connected_readiness_after_a_redial()
 async fn test_a_newer_sleeve_does_not_waive_an_instruments_position_mismatch() {
     // The venue reports 0.06 ETH while the cache holds only 0.01, and that one
     // sleeve's last event is newer than the account snapshot. A timestamp is
-    // not proof that the venue view omits the local event — the position
-    // request ran after the account request it is compared against — so the
+    // not proof that the venue view omits the local event - the position
+    // request ran after the account request it is compared against - so the
     // mismatch must keep the generation unapplied rather than being waived.
     let rest_state = RestState::default();
     *rest_state.positions_response.lock().await = json!({
@@ -3254,7 +3254,7 @@ async fn test_a_write_parked_on_quota_is_re_gated_after_the_wait() {
     // Scope: this pins admission happening *after* the quota wait, and goes red
     // when that check is removed. It does not isolate the client's own
     // pre-enqueue hook, because the hook's ambiguity condition is identical to
-    // the admission gate's a few lines earlier — the hook's ordering is covered
+    // the admission gate's a few lines earlier - the hook's ordering is covered
     // by `test_a_queued_websocket_entry_is_refused_when_fallback_opens_while_it_waits`,
     // where the routing state diverges between the two, and by the
     // `pre_send_check` unit tests.
@@ -3414,7 +3414,7 @@ async fn test_a_queued_websocket_entry_is_refused_when_fallback_opens_while_it_w
     // The command is admitted on a healthy session, parks in its asynchronous
     // preparation, and the session then drops and re-authenticates. Execution
     // is in fallback with its recovery unapplied, so the parked entry must be
-    // refused before it reaches the venue — nothing about it is ambiguous, so
+    // refused before it reaches the venue - nothing about it is ambiguous, so
     // only a check of the *current* routing state can catch it.
     let rest_state = RestState::default();
     let ws_state = WsState::default();
@@ -3598,7 +3598,7 @@ async fn test_limit_entry_without_a_quote_is_denied_during_rest_fallback() {
 #[tokio::test]
 async fn test_expired_quote_denies_a_limit_entry_during_rest_fallback() {
     // The quote bound is deliberately much tighter than the account-state
-    // bound, so this proves the gate honours its own dedicated quote bound
+    // bound, so this proves the gate honors its own dedicated quote bound
     // rather than the (generous) private-state one.
     let rest_state = RestState::default();
     let ws_state = WsState::default();
@@ -3814,7 +3814,7 @@ async fn test_slow_history_traversal_does_not_refresh_an_expired_account_snapsho
 async fn test_market_orders_use_the_direct_ticker_when_the_bulk_map_is_empty() {
     // The outage this failover exists for returns an empty `public/get_tickers`
     // map, so a quote refresh built on the bulk endpoint rejects every market
-    // order — entries and risk-reducing exits alike.
+    // order - entries and risk-reducing exits alike.
     let rest_state = RestState::default();
     *rest_state.ticker_response.lock().await = json!({"tickers": {}});
     *rest_state.direct_ticker_response.lock().await = fresh_ticker_json("ETH-PERP");
@@ -5158,7 +5158,7 @@ async fn denied_reason(
     let event = drain_denied_without_submitted(rx, client_order_id).await;
     match event {
         ExecutionEvent::Order(OrderEventAny::Denied(denied)) => denied.reason.to_string(),
-        other => panic!("expected OrderDenied, got {other:?}"),
+        other => panic!("expected OrderDenied, was {other:?}"),
     }
 }
 

@@ -591,22 +591,22 @@ non-options. Verify the instrument class before subscribing to derivative-specif
 
 Class/struct: `DeriveDataClientConfig`.
 
-| Option                             | Default   | Description                                                                                 |
-| ---------------------------------- | --------- | ------------------------------------------------------------------------------------------- |
-| `base_url_rest`                    | `None`    | Override for the REST base URL.                                                             |
-| `base_url_ws`                      | `None`    | Override for the WebSocket base URL.                                                        |
-| `proxy_url`                        | `None`    | Optional proxy URL for HTTP and WebSocket transports.                                       |
-| `environment`                      | `Mainnet` | Network selector (`MAINNET` or `TESTNET` in Python).                                        |
-| `http_timeout_secs`                | `10`      | REST request timeout in seconds.                                                            |
-| `ws_timeout_secs`                  | `None`    | Per-operation WebSocket timeout (login, subscribe, read, write) in seconds. Unset uses 10s. |
-| `update_instruments_interval_mins` | `60`      | Interval in minutes between instrument refreshes.                                           |
-| `currencies`                       | `[]`      | Currencies to bulk-load on connect. Empty means lazy-load on demand.                        |
-| `include_expired`                  | `false`   | Include expired option rows from `public/get_instruments`.                                  |
-| `auto_load_missing_instruments`    | `true`    | Lazy-load an unknown instrument before sending a subscribe request.                         |
-| `rest_market_data_failover_enabled`| `false`   | Temporary incident workaround; see [REST polling failover](#rest-polling-failover-temporary).|
-| `rest_market_data_poll_interval_ms`| `None`    | REST quote polling interval in milliseconds. Required (and must be positive) when the option above is enabled. |
-| `rest_market_data_max_quote_age_secs`| `None`  | Maximum accepted REST quote age in seconds. Required (and must be positive) when failover is enabled. |
-| `transport_backend`                | `Sockudo` | WebSocket transport when `transport-sockudo` is enabled.                                    |
+| Option                                | Default   | Description                                                                                                    |
+| ------------------------------------- | --------- | -------------------------------------------------------------------------------------------------------------- |
+| `base_url_rest`                       | `None`    | Override for the REST base URL.                                                                                |
+| `base_url_ws`                         | `None`    | Override for the WebSocket base URL.                                                                           |
+| `proxy_url`                           | `None`    | Optional proxy URL for HTTP and WebSocket transports.                                                          |
+| `environment`                         | `Mainnet` | Network selector (`MAINNET` or `TESTNET` in Python).                                                           |
+| `http_timeout_secs`                   | `10`      | REST request timeout in seconds.                                                                               |
+| `ws_timeout_secs`                     | `None`    | Per-operation WebSocket timeout (login, subscribe, read, write) in seconds. Unset uses 10s.                    |
+| `update_instruments_interval_mins`    | `60`      | Interval in minutes between instrument refreshes.                                                              |
+| `currencies`                          | `[]`      | Currencies to bulk-load on connect. Empty means lazy-load on demand.                                           |
+| `include_expired`                     | `false`   | Include expired option rows from `public/get_instruments`.                                                     |
+| `auto_load_missing_instruments`       | `true`    | Lazy-load an unknown instrument before sending a subscribe request.                                            |
+| `rest_market_data_failover_enabled`   | `false`   | Temporary incident workaround; see [REST polling failover](#rest-polling-failover-temporary).                  |
+| `rest_market_data_poll_interval_ms`   | `None`    | REST quote polling interval in milliseconds. Required (and must be positive) when the option above is enabled. |
+| `rest_market_data_max_quote_age_secs` | `None`    | Maximum accepted REST quote age in seconds. Required (and must be positive) when failover is enabled.          |
+| `transport_backend`                   | `Sockudo` | WebSocket transport when `transport-sockudo` is enabled.                                                       |
 
 `auto_load_missing_instruments` covers subscribe commands only. The request commands
 (`request_quotes`, `request_trades`, `request_bars`, and `request_funding_rates`) fail when
@@ -618,34 +618,34 @@ subscriptions also require a cached option from the series to fetch the initial 
 
 Class/struct: `DeriveExecutionClientConfig`.
 
-| Option                                            | Default   | Description                                                                                                                                                                       |
-| ------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `account_id`                                      | `Venue`   | Nautilus account identifier; defaults to `DERIVE-001`.                                                                                                                            |
-| `wallet_address`                                  | `None`    | Derive Chain smart-contract wallet address. Falls back to env vars below.                                                                                                         |
-| `session_key`                                     | `None`    | secp256k1 session-key private key. Falls back to env vars below.                                                                                                                  |
-| `subaccount_id`                                   | `None`    | Derive subaccount id. Falls back to env vars below.                                                                                                                               |
-| `base_url_rest`                                   | `None`    | Override for the REST base URL.                                                                                                                                                   |
-| `base_url_ws`                                     | `None`    | Override for the WebSocket base URL.                                                                                                                                              |
-| `proxy_url`                                       | `None`    | Optional proxy URL for HTTP and WebSocket transports.                                                                                                                             |
-| `environment`                                     | `Mainnet` | Network selector (`MAINNET` or `TESTNET` in Python).                                                                                                                              |
-| `http_timeout_secs`                               | `10`      | REST request timeout in seconds.                                                                                                                                                  |
-| `ws_timeout_secs`                                 | `None`    | Per-operation WebSocket timeout (login, subscribe, read, write) in seconds. Unset uses 10s.                                                                                       |
-| `max_retries`                                     | `3`       | Retry attempts for idempotent REST reads. Order writes are sent once and never replayed.                                                                                          |
-| `retry_delay_initial_ms`                          | `100`     | Initial retry delay in milliseconds.                                                                                                                                              |
-| `retry_delay_max_ms`                              | `5,000`   | Maximum retry delay in milliseconds.                                                                                                                                              |
-| `max_fee_per_contract`                            | Required  | Positive per-contract USDC fee cap signed into each order.                                                                                                                        |
-| `domain_separator`                                | `None`    | Optional EIP-712 domain separator override.                                                                                                                                       |
-| `action_typehash`                                 | `None`    | Optional EIP-712 action typehash override.                                                                                                                                        |
-| `trade_module_address`                            | `None`    | Optional Trade module contract address override.                                                                                                                                  |
-| `signature_expiry_secs`                           | `600`     | Order/replace TTL; must be >300s. Trigger orders use fixed 31-day TTL.                                                                                                            |
-| `market_order_slippage_bps`                       | `50`      | Slippage bound for market-order limit prices.                                                                                                                                     |
-| `max_matching_requests_per_second`                | `None`    | Account-wide matching-engine write requests/sec (order/replace/cancel incl. trigger methods). Defaults to the Trader-tier limit of 1 when unset; raise for Market Maker accounts. |
-| `max_per_instrument_matching_requests_per_second` | `None`    | Per-instrument matching write requests/sec, enforced independently of the account-wide limit. Defaults to the Trader-tier limit of 1 when unset; raise for Market Maker accounts. |
-| `transport_backend`                               | `Sockudo` | WebSocket transport when `transport-sockudo` is enabled.                                                                                                                          |
-| `rest_fallback_enabled`                           | `false`   | Temporary incident workaround; see [REST polling failover](#rest-polling-failover-temporary).                                                                                    |
-| `private_state_poll_interval_secs`                | `None`    | Interval in seconds between private-state reconciliations while REST fallback is active. Required (and must be positive) when the option above is enabled.                      |
-| `max_account_state_age_secs`                      | `None`    | Maximum age in seconds of the last successful **private-state** reconciliation (account/positions/orders) for allowing risk-increasing orders. Required (and must be positive) when REST fallback is enabled. |
-| `max_quote_age_secs`                              | `None`    | Maximum age in seconds of the **quote** used for market-order pricing and the risk-increasing entry/replace gate. Independent of `max_account_state_age_secs` and of the data client's `rest_market_data_max_quote_age_secs` — execution enforces its own bound rather than assuming data's is at least as strict. Required (and must be positive) when REST fallback is enabled. |
+| Option                                            | Default   | Description                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `account_id`                                      | `Venue`   | Nautilus account identifier; defaults to `DERIVE-001`.                                                                                                                                                                                                                                                                                                                            |
+| `wallet_address`                                  | `None`    | Derive Chain smart-contract wallet address. Falls back to env vars below.                                                                                                                                                                                                                                                                                                         |
+| `session_key`                                     | `None`    | secp256k1 session-key private key. Falls back to env vars below.                                                                                                                                                                                                                                                                                                                  |
+| `subaccount_id`                                   | `None`    | Derive subaccount id. Falls back to env vars below.                                                                                                                                                                                                                                                                                                                               |
+| `base_url_rest`                                   | `None`    | Override for the REST base URL.                                                                                                                                                                                                                                                                                                                                                   |
+| `base_url_ws`                                     | `None`    | Override for the WebSocket base URL.                                                                                                                                                                                                                                                                                                                                              |
+| `proxy_url`                                       | `None`    | Optional proxy URL for HTTP and WebSocket transports.                                                                                                                                                                                                                                                                                                                             |
+| `environment`                                     | `Mainnet` | Network selector (`MAINNET` or `TESTNET` in Python).                                                                                                                                                                                                                                                                                                                              |
+| `http_timeout_secs`                               | `10`      | REST request timeout in seconds.                                                                                                                                                                                                                                                                                                                                                  |
+| `ws_timeout_secs`                                 | `None`    | Per-operation WebSocket timeout (login, subscribe, read, write) in seconds. Unset uses 10s.                                                                                                                                                                                                                                                                                       |
+| `max_retries`                                     | `3`       | Retry attempts for idempotent REST reads. Order writes are sent once and never replayed.                                                                                                                                                                                                                                                                                          |
+| `retry_delay_initial_ms`                          | `100`     | Initial retry delay in milliseconds.                                                                                                                                                                                                                                                                                                                                              |
+| `retry_delay_max_ms`                              | `5,000`   | Maximum retry delay in milliseconds.                                                                                                                                                                                                                                                                                                                                              |
+| `max_fee_per_contract`                            | Required  | Positive per-contract USDC fee cap signed into each order.                                                                                                                                                                                                                                                                                                                        |
+| `domain_separator`                                | `None`    | Optional EIP-712 domain separator override.                                                                                                                                                                                                                                                                                                                                       |
+| `action_typehash`                                 | `None`    | Optional EIP-712 action typehash override.                                                                                                                                                                                                                                                                                                                                        |
+| `trade_module_address`                            | `None`    | Optional Trade module contract address override.                                                                                                                                                                                                                                                                                                                                  |
+| `signature_expiry_secs`                           | `600`     | Order/replace TTL; must be >300s. Trigger orders use fixed 31-day TTL.                                                                                                                                                                                                                                                                                                            |
+| `market_order_slippage_bps`                       | `50`      | Slippage bound for market-order limit prices.                                                                                                                                                                                                                                                                                                                                     |
+| `max_matching_requests_per_second`                | `None`    | Account-wide matching-engine write requests/sec (order/replace/cancel incl. trigger methods). Defaults to the Trader-tier limit of 1 when unset; raise for Market Maker accounts.                                                                                                                                                                                                 |
+| `max_per_instrument_matching_requests_per_second` | `None`    | Per-instrument matching write requests/sec, enforced independently of the account-wide limit. Defaults to the Trader-tier limit of 1 when unset; raise for Market Maker accounts.                                                                                                                                                                                                 |
+| `transport_backend`                               | `Sockudo` | WebSocket transport when `transport-sockudo` is enabled.                                                                                                                                                                                                                                                                                                                          |
+| `rest_fallback_enabled`                           | `false`   | Temporary incident workaround; see [REST polling failover](#rest-polling-failover-temporary).                                                                                                                                                                                                                                                                                     |
+| `private_state_poll_interval_secs`                | `None`    | Interval in seconds between private-state reconciliations while REST fallback is active. Required (and must be positive) when the option above is enabled.                                                                                                                                                                                                                        |
+| `max_account_state_age_secs`                      | `None`    | Maximum age in seconds of the last successful **private-state** reconciliation (account/positions/orders) for allowing risk-increasing orders. Required (and must be positive) when REST fallback is enabled.                                                                                                                                                                     |
+| `max_quote_age_secs`                              | `None`    | Maximum age in seconds of the **quote** used for market-order pricing and the risk-increasing entry/replace gate. Independent of `max_account_state_age_secs` and of the data client's `rest_market_data_max_quote_age_secs` - execution enforces its own bound rather than assuming data's is at least as strict. Required (and must be positive) when REST fallback is enabled. |
 
 The default transport falls back to `Tungstenite` when the build disables the
 `transport-sockudo` feature.
@@ -693,7 +693,7 @@ maximum-age fields set to a value greater than zero: `rest_market_data_poll_inte
 `rest_market_data_max_quote_age_secs` for data; `private_state_poll_interval_secs`,
 `max_account_state_age_secs`, and `max_quote_age_secs` for execution. None of these has a built-in
 default once enabled, and this adapter does not ship a recommended production cadence as a
-default — see [Rate limiting](#rate-limiting) and choose polling intervals and maximum ages from
+default - see [Rate limiting](#rate-limiting) and choose polling intervals and maximum ages from
 the venue's documented per-IP and per-wallet limits, sized for however many instruments and
 accounts the deployment actually polls.
 
@@ -704,7 +704,7 @@ execution client polls private state (subaccount, open orders, positions, recent
 configured interval while the WebSocket session is unauthenticated or unavailable, and returns to
 WebSocket-only operation once the socket reconnects and reconciliation completes. Execution's own
 `max_account_state_age_secs` and `max_quote_age_secs` bounds are enforced independently of each
-other and of the data client's bound — a fresh quote does not excuse stale private state, and
+other and of the data client's bound - a fresh quote does not excuse stale private state, and
 vice versa.
 
 **Unresolved-write halting.** A REST (or WebSocket) order write whose outcome is ambiguous (for
@@ -712,11 +712,11 @@ example, a transport error or timeout where the venue's acceptance of the reques
 confirmed) blocks new risk-increasing orders for the affected client. This is a deliberate
 fail-closed stance: an unresolved write is treated as "maybe live" until proven otherwise, never as
 rejected. The block is lifted **only** by a definitive, positive venue report naming that specific
-write — never by a timeout or by the absence of the order from a private-state read, since an
+write - never by a timeout or by the absence of the order from a private-state read, since an
 absent-looking read does not prove the write never reached the venue. What counts as that
 definitive report depends on the write: for a **submit**, any report naming the resulting order
 (including a fill) proves the submission reached the venue. For a **cancel or replace**, only a
-**terminal** report of the targeted order (closed, or — for a replace — the replacement order
+**terminal** report of the targeted order (closed, or - for a replace - the replacement order
 reported) resolves it; an arbitrary fill on the target is not evidence that a cancel or replace
 against it was ever applied, since the target can legitimately keep filling while that cancel or
 replace is still outstanding. If the venue never produces that definitive evidence, the block
@@ -731,7 +731,7 @@ These are rejected explicitly rather than silently degraded; reduce-only submits
 `cancel_order` remain available so a position can still be de-risked during the outage.
 
 **Reduce-only submits bypass the entry-side risk gates by design, but not market-order pricing.**
-A reduce-only order cannot increase exposure — Derive refuses a reduce-only order that would — so
+A reduce-only order cannot increase exposure - Derive refuses a reduce-only order that would - so
 these submits are deliberately exempt from the private-state freshness gate, the risk-increasing
 quote-age gate, and unrelated account-wide ambiguity, keeping the de-risking lever available during
 exactly the outage this failover exists for. That asymmetry rests entirely on the venue enforcing
@@ -746,7 +746,7 @@ and execution's private-state polling both draw from the same per-wallet/IP non-
 (see [Rate limiting](#rate-limiting)); this adapter cannot see the combined total across both
 clients, so no hard limit is enforced across them. The data client logs a one-time warning if its
 own polling alone (instrument count ÷ poll interval) would exceed half the documented non-matching
-TPS budget, as a conservative heads-up that leaves headroom for execution's share — but passing
+TPS budget, as a conservative heads-up that leaves headroom for execution's share - but passing
 that check is not proof the combined cadence is safe; size both clients' intervals from the
 documented venue limits for the actual number of instruments and accounts polled.
 

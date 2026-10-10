@@ -2271,7 +2271,7 @@ impl SubscriptionLifecycle {
     /// (the same lock `Reconnected` holds while bumping the session
     /// generation and clearing confirmation state), closing the gap where a
     /// stale subscribe task could otherwise re-confirm a channel in between
-    /// a passed check and the write landing — after a concurrent
+    /// a passed check and the write landing - after a concurrent
     /// unsubscribe/resubscribe or reconnect already invalidated it.
     fn confirm_quote_subscription_if_current(
         &self,
@@ -3069,7 +3069,7 @@ fn rest_poll_budget_exceeded(
 }
 
 /// Grows `current` by the shared reconnect backoff factor, capped at the
-/// shared maximum — the same growth `execution.rs`'s WebSocket retry loop
+/// shared maximum - the same growth `execution.rs`'s WebSocket retry loop
 /// uses. A pure function so the retry schedule is unit-testable without
 /// waiting out real sleeps.
 fn next_reconnect_delay(current: Duration) -> Duration {
@@ -3186,7 +3186,7 @@ mod tests {
 
     #[rstest]
     fn test_next_reconnect_delay_grows_and_caps_at_the_shared_maximum() {
-        // A sustained upgrade outage must not keep dialling at the base
+        // A sustained upgrade outage must not keep dialing at the base
         // interval forever (≈14k attempts/hour against an already-503ing
         // venue); it must grow like `execution.rs`'s retry loop and
         // eventually plateau at the shared cap.

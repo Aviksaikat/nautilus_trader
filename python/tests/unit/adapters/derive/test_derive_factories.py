@@ -51,7 +51,9 @@ def test_derive_factories_expose_python_names() -> None:
 
 
 def test_derive_execution_config_accepts_rest_fallback_options() -> None:
-    """REST fallback config remains constructible through the Python API."""
+    """
+    REST fallback config remains constructible through the Python API.
+    """
     config = DeriveExecutionClientConfig(
         rest_fallback_enabled=True,
         private_state_poll_interval_secs=5,

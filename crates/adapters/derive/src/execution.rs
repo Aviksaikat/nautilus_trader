@@ -164,7 +164,7 @@ const REST_GATE_UNRESOLVED_WRITE: &str = "Derive execution has a write with an u
 /// Whether every row a reconciliation needed was converted.
 ///
 /// The reused report APIs are deliberately best-effort: they log and omit a row
-/// they cannot convert, and keep that behaviour for every other caller. A REST
+/// they cannot convert, and keep that behavior for every other caller. A REST
 /// admission decision may not read an omission as a complete picture, so the
 /// counts travel alongside the reports.
 #[derive(Debug, Clone, Copy, Default)]
@@ -531,7 +531,7 @@ impl DeriveExecutionClient {
     ) -> Option<&'static str> {
         let now_ns = self.clock.get_time_ns().as_u64();
         // Always evaluated, and before any early return, because it is what
-        // latches the applied generation while the cache is reachable — both
+        // latches the applied generation while the cache is reachable - both
         // for the reservation that re-checks inside the spawned task and for
         // the routing decision that hands order entry back to the WebSocket.
         let applied = self.refresh_applied_generation();
@@ -564,7 +564,7 @@ impl DeriveExecutionClient {
     /// generation, this is also the earliest point at which routing may return
     /// to the WebSocket, so the decision is taken here rather than waiting for
     /// the next poll tick. An unresolved write deliberately does not keep
-    /// routing in REST mode — it halts risk-increasing commands on either
+    /// routing in REST mode - it halts risk-increasing commands on either
     /// transport instead.
     fn note_reconciliation_application(&self) {
         if !self.config.rest_fallback_enabled {
@@ -614,7 +614,7 @@ impl DeriveExecutionClient {
     /// replacement or an unapplied partial fill is never mistaken for applied
     /// state. For every reported open position the cache must hold the same
     /// side and quantity, and the cache must not hold an open order or position
-    /// that this generation's snapshot should have contained but did not — so
+    /// that this generation's snapshot should have contained but did not - so
     /// an empty report set proves application only when the cache is also free
     /// of contrary state, never vacuously. Local state whose last event is
     /// newer than the snapshot is exempt, because a snapshot cannot contain
@@ -740,7 +740,7 @@ impl DeriveExecutionClient {
                     continue;
                 }
                 // They disagree. A local event newer than the snapshot does not
-                // excuse the difference — the snapshot's own position request
+                // excuse the difference - the snapshot's own position request
                 // ran *after* the account request this timestamp is taken from,
                 // so a newer local event is no proof the venue view omits it,
                 // and the mismatch may just as easily be exposure that never
@@ -760,8 +760,8 @@ impl DeriveExecutionClient {
         }
 
         if disagreement.is_none() {
-            // A fill-only report — the venue sent a fill with no order report
-            // carrying the label — must also be reflected before admission, or
+            // A fill-only report - the venue sent a fill with no order report
+            // carrying the label - must also be reflected before admission, or
             // a submit resolved purely by fill evidence would open the gate on
             // exposure the cache has not taken on. Reports are deduplicated
             // against fills already applied, so the reported total is the
@@ -924,7 +924,7 @@ impl DeriveExecutionClient {
 
     /// Starts the session's single WebSocket supervisor.
     ///
-    /// One task owns redialling for the whole session, on both startup routes.
+    /// One task owns redialing for the whole session, on both startup routes.
     /// A healthy start parks it immediately; it wakes only once the socket's own
     /// recovery has been exhausted (`ws_recovery_exhausted`), so it never races
     /// the transport's internal reconnect. Without it on the healthy route, a
@@ -953,7 +953,7 @@ impl DeriveExecutionClient {
                 // reconciliation loop has seen an unauthenticated socket for
                 // several consecutive ticks. The run of observations matters:
                 // readiness is cleared during any transient in-place reconnect,
-                // and redialling on the first sighting would tear down a
+                // and redialing on the first sighting would tear down a
                 // recovery that was about to succeed. A healthy startup does
                 // nothing here until the session actually fails.
                 while !{
@@ -1026,8 +1026,9 @@ impl DeriveExecutionClient {
                     .rest_execution_state
                     .websocket_ready
                     .store(true, Ordering::Release);
+
                 if let Err(e) = context.recover_after_reconnect().await {
-                    // The transport itself is healthy — only the admission gate
+                    // The transport itself is healthy - only the admission gate
                     // is unsatisfied (an incomplete, stale or not-yet-applied
                     // reconciliation). Tearing the socket down again would
                     // churn the venue connection over a condition that the
@@ -1051,7 +1052,7 @@ impl DeriveExecutionClient {
                     .rest_execution_state
                     .ws_recovery_exhausted
                     .store(false, Ordering::Release);
-                log::info!("Derive execution WebSocket session redialled and reconciled");
+                log::info!("Derive execution WebSocket session redialed and reconciled");
             }
         })?;
         Ok(())
@@ -1554,8 +1555,8 @@ impl ExecutionClient for DeriveExecutionClient {
         }
 
         let use_rest_fallback = self.should_use_rest_fallback();
-        // Reduce-only submits cannot increase exposure — the venue refuses a
-        // reduce-only order that would — so they are deliberately exempt from
+        // Reduce-only submits cannot increase exposure - the venue refuses a
+        // reduce-only order that would - so they are deliberately exempt from
         // the private-state freshness and quote *admission* gates, and from
         // unrelated account-wide uncertainty. That asymmetry rests entirely on
         // the venue enforcing `reduce_only`, and it is what keeps the
@@ -1665,7 +1666,7 @@ impl ExecutionClient for DeriveExecutionClient {
         let rest_http_client = http_client.clone();
         let max_account_state_age_secs = self.config.max_account_state_age_secs;
         // The quote age bound belongs to the fallback feature, so the
-        // default-off WebSocket-only path keeps its existing behaviour. It is
+        // default-off WebSocket-only path keeps its existing behavior. It is
         // the dedicated execution quote bound, never the account-state bound.
         let quote_max_age_secs = self
             .config
@@ -2184,7 +2185,7 @@ impl ExecutionClient for DeriveExecutionClient {
             // the command-sender read lock before enqueueing, so this check is
             // not the last word: the `*_checked` helper runs `pre_send_check`
             // after both of those, immediately before the enqueue. Quota is
-            // deliberately reserved before signing, not after — reserving
+            // deliberately reserved before signing, not after - reserving
             // after would spend the signature's TTL on pacing, which
             // `test_deeply_paced_submit_builds_signature_after_matching_quota_wait`
             // exists to prevent.
@@ -2192,7 +2193,7 @@ impl ExecutionClient for DeriveExecutionClient {
             // Only when the fallback feature is enabled. With it off there is
             // no reconciliation loop to ever resolve an unresolved record, so
             // tracking one here would halt entries for the rest of the process
-            // on the first ambiguous response — a regression on a path this
+            // on the first ambiguous response - a regression on a path this
             // branch is meant to leave untouched.
             let write_reservation = if rest_fallback_enabled {
                 match reserve_write(
@@ -3319,7 +3320,7 @@ impl RestWriteKind {
 ///
 /// Only the write that obtained a token may retire its record, so a late
 /// response can never release uncertainty about a different operation. Tokens
-/// start at 1, so no default-initialised value is ever a valid token.
+/// start at 1, so no default-initialized value is ever a valid token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OperationToken(u64);
 
@@ -3366,9 +3367,9 @@ struct UnresolvedWrite {
 ///
 /// The record is keyed by token, not by client order id, so two operations on
 /// the same order can be outstanding at once and neither can overwrite the
-/// other. Dropping the guard without recording an outcome — the task was
+/// other. Dropping the guard without recording an outcome - the task was
 /// aborted by `stop()`, `disconnect()` or a teardown between the reservation
-/// and the response — downgrades the record to [`WriteStage::Ambiguous`] rather
+/// and the response - downgrades the record to [`WriteStage::Ambiguous`] rather
 /// than leaving it `InFlight` forever: the request may have been sent, so the
 /// uncertainty is real, but it must be something positive evidence can later
 /// resolve. A guard that is still alive means the task is still running, and
@@ -3418,7 +3419,7 @@ impl Drop for WriteReservation {
 enum WriteAdmission {
     /// Routed over REST while fallback is active: fresh, applied private
     /// state, a fresh quote, and no outstanding write of any kind anywhere on
-    /// the account. REST writes are serialised by the venue's matching
+    /// the account. REST writes are serialized by the venue's matching
     /// allowance anyway, so the stricter exclusivity costs nothing.
     Fallback {
         quote_ts_event: Option<UnixNanos>,
@@ -3428,7 +3429,7 @@ enum WriteAdmission {
     /// writes whose outcome is actually unknown (`Ambiguous`). REST private
     /// state is not maintained while the socket is healthy, so its freshness
     /// says nothing; and blocking on another request merely being in flight
-    /// would serialise ordinary WebSocket order entry.
+    /// would serialize ordinary WebSocket order entry.
     WebSocket,
 }
 
@@ -3456,7 +3457,7 @@ struct RestExecutionState {
     /// dial.
     ws_recovery_exhausted: AtomicBool,
     /// Consecutive reconciliation ticks that observed an unauthenticated
-    /// socket. The supervisor waits for a short run of these before redialling,
+    /// socket. The supervisor waits for a short run of these before redialing,
     /// so a transient in-place reconnect is never torn down mid-recovery.
     unauthenticated_observations: AtomicU32,
     /// Writes whose venue outcome is unknown, keyed by the token that owns each
@@ -3507,8 +3508,8 @@ impl RestExecutionState {
     /// Final check, run by the WebSocket client immediately before it enqueues
     /// a reserved write.
     ///
-    /// Everything between admission and the enqueue — the client's window
-    /// re-pacing and its command-sender lock — happens after this write was
+    /// Everything between admission and the enqueue - the client's window
+    /// re-pacing and its command-sender lock - happens after this write was
     /// admitted, so another write's outcome can become unknown in the
     /// meantime. Refusing here is the last point at which the request can be
     /// stopped without having reached the venue. One lock, taken once.
@@ -3648,11 +3649,11 @@ fn has_unresolved_writes(state: &RestExecutionState) -> bool {
     !state.unresolved_writes.lock().is_empty()
 }
 
-/// Whether any write's outcome is actually *unknown* — its request completed
+/// Whether any write's outcome is actually *unknown* - its request completed
 /// with no verdict.
 ///
 /// This is the term the healthy-WebSocket path uses: it halts new exposure
-/// against a possibly-live order without serialising ordinary order entry
+/// against a possibly-live order without serializing ordinary order entry
 /// behind every request that merely happens to be in flight.
 fn has_ambiguous_writes(state: &RestExecutionState) -> bool {
     state
@@ -3668,7 +3669,7 @@ fn has_ambiguous_writes(state: &RestExecutionState) -> bool {
 ///
 /// The refusal travels back through the slot rather than through the returned
 /// error, because the error variants that mean "the venue may have seen this"
-/// and "this never left the process" are not distinguishable by inspection —
+/// and "this never left the process" are not distinguishable by inspection -
 /// and recording an unsent write as ambiguous would halt entries for nothing.
 /// `None` for `token` (the fallback feature is disabled) always admits, so the
 /// default path behaves exactly as it did before this feature existed.
@@ -3706,8 +3707,8 @@ fn pre_send_check(
 /// transport, returning the reservation that owns the resulting record.
 ///
 /// The check and the reservation happen under one lock, so a command that
-/// cleared the gate earlier — synchronously, or before awaiting instrument
-/// resolution and matching quota — cannot slip past a halt that appeared while
+/// cleared the gate earlier - synchronously, or before awaiting instrument
+/// resolution and matching quota - cannot slip past a halt that appeared while
 /// it waited. The reservation must be settled by [`WriteReservation::resolve`]
 /// or [`WriteReservation::mark_ambiguous`]; dropping it unsettled records the
 /// write as ambiguous rather than losing it.
@@ -3750,7 +3751,7 @@ fn reserve_write(
         // An exposure-reducing command needs only the venue state it acts on to
         // be settled. Two operations on the same *order* may legitimately be
         // outstanding at once (a replace of the old leg and a cancel of the new
-        // one), so the conflict is per venue order — plus an unresolved submit
+        // one), so the conflict is per venue order - plus an unresolved submit
         // of this very order, whose existence is not yet established.
         match (venue_order_id, write.venue_order_id) {
             (Some(target), Some(outstanding)) => target == outstanding,
@@ -3870,7 +3871,7 @@ impl DeriveReconciliationContext {
         if !self.rest_fallback_enabled {
             // Default path: readiness follows the transport, exactly as it did
             // before this feature existed. The post-reconnect reconciliation
-            // still runs, but none of the REST admission predicates apply —
+            // still runs, but none of the REST admission predicates apply -
             // `max_account_state_age_secs` is `None` by default, so gating
             // readiness on them would leave a recovered socket permanently
             // reported as disconnected.
@@ -3889,7 +3890,7 @@ impl DeriveReconciliationContext {
         // Both routes back to WebSocket order entry require the same thing: a
         // complete reconciliation, observed inside the configured age, that the
         // engine has applied. An unresolved write deliberately does *not* block
-        // this — routing and admission are separate concerns, and the
+        // this - routing and admission are separate concerns, and the
         // unresolved-write gate keeps risk-increasing commands halted on the
         // WebSocket path too (see `reserve_write`). Blocking recovery on it
         // instead would strand the client in REST mode for the whole process.
@@ -3928,7 +3929,7 @@ impl DeriveReconciliationContext {
         let now_ns = self.clock.get_time_ns().as_u64();
         for write in outstanding {
             log::warn!(
-                "Derive execution halted (state=halted): {} for {} still has an unknown venue outcome after {} ns (stage={:?}, venue_order_id={:?}); it is never retried and only a venue report for this operation can resolve it. Risk-increasing orders stay blocked; operator action or a process restart is required if no report ever arrives.",
+                "Derive execution halted (state=halted): {} for {} still has an unknown venue outcome after {} ns (stage={:?}, venue_order_id={:?}); it is never retried and only a venue report for this operation can resolve it. Risk-increasing orders stay blocked; operator action or a process restart is required if no report ever arrives",
                 write.kind.as_str(),
                 write.client_order_id,
                 now_ns.saturating_sub(write.recorded_ns),
@@ -4000,8 +4001,8 @@ impl DeriveReconciliationContext {
     ///
     /// Only reports carrying a client order id are usable: an order the engine
     /// tracks is matched by label, and the per-label expectation is the current
-    /// leg — an open report beats a closed one, and among equally closed
-    /// reports the most recently updated wins — so a closed historical
+    /// leg - an open report beats a closed one, and among equally closed
+    /// reports the most recently updated wins - so a closed historical
     /// replacement leg never stands in for the live replacement.
     fn record_reported_state(
         &self,
@@ -4102,7 +4103,7 @@ impl DeriveReconciliationContext {
         }
 
         // Fills are evidence for a *submit* only: they prove the order came
-        // into existence. They prove nothing about a cancel or a replace — a
+        // into existence. They prove nothing about a cancel or a replace - a
         // full-history read keeps returning partial fills from before the
         // command, while the targeted order can still be open with a live
         // remainder.
@@ -5364,7 +5365,7 @@ fn normal_order_signature_expiry(
 ///
 /// Uses the instrument-specific `public/get_ticker` endpoint, not the bulk
 /// `public/get_tickers` map: during the outage this failover exists for, the
-/// bulk map comes back empty, which would reject every market order — entries
+/// bulk map comes back empty, which would reject every market order - entries
 /// and risk-reducing exits alike. The returned quote is validated for a usable
 /// two-sided book and bounded against `max_quote_age_secs` before anything is
 /// signed; `None` leaves the age unbounded, which is the default-off
@@ -5729,7 +5730,7 @@ mod tests {
         // A WebSocket replace of A→B is still outstanding when, during
         // fallback, a REST cancel of B takes its own reservation. The replace's
         // late ambiguous result must settle only itself, and A going terminal
-        // in the next reconciliation must resolve only the replace — the
+        // in the next reconciliation must resolve only the replace - the
         // cancel's halt has to survive both.
         let client = test_client_with_instrument();
         let state = Arc::clone(&client.rest_execution_state);
@@ -5847,7 +5848,7 @@ mod tests {
         // The routing decision is taken before a command's asynchronous
         // preparation, so a write admitted on a healthy session can reach the
         // enqueue boundary after execution has entered fallback. Authentication
-        // being restored is not enough — recovery keeps fallback active until
+        // being restored is not enough - recovery keeps fallback active until
         // its reconciliation is complete, fresh and applied.
         let state = Arc::new(RestExecutionState::default());
         let queued = reserve_write(
@@ -5952,7 +5953,7 @@ mod tests {
     #[rstest]
     fn test_pre_send_check_admits_everything_when_the_fallback_feature_is_off() {
         // With the feature disabled no reservation is taken, so the hook must
-        // never refuse — the default path has to behave exactly as it did
+        // never refuse - the default path has to behave exactly as it did
         // before this feature existed, even with an ambiguous record present.
         let state = Arc::new(RestExecutionState::default());
         let stale = reserve_write(
@@ -6041,7 +6042,7 @@ mod tests {
     fn test_halt_logging_never_holds_one_state_lock_while_taking_the_other() {
         // The admission gate holds `unresolved_writes` while it reads the
         // reported generation, so any diagnostic that acquires those two in the
-        // opposite order wedges the command thread — and takes the flatten path
+        // opposite order wedges the command thread - and takes the flatten path
         // down with it. This drives that exact pairing: the test plays the gate
         // (holding `unresolved_writes`, then wanting `reported_state`) while a
         // worker logs a halt. It fails on a deadline instead of hanging.
@@ -6573,7 +6574,7 @@ mod tests {
             venue_order_id,
             Some(OrderSide::Buy),
             OrderType::Limit,
-            nautilus_model::enums::TimeInForce::Gtc,
+            TimeInForce::Gtc,
             order_status,
             Quantity::from("1.000"),
             Quantity::from("0.000"),

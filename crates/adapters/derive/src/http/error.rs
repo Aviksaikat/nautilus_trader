@@ -118,8 +118,8 @@ impl DeriveHttpError {
     /// Both classifications defer to the shared policy in
     /// [`crate::common::retry`], so the HTTP and WebSocket write paths treat
     /// the same venue response the same way: JSON-RPC codes follow
-    /// [`is_write_outcome_ambiguous_jsonrpc`] (only `-32603`), and HTTP
-    /// statuses follow [`is_write_outcome_definitive_http_status`] — 4xx
+    /// `is_write_outcome_ambiguous_jsonrpc` (only `-32603`), and HTTP
+    /// statuses follow [`is_write_outcome_definitive_http_status`] - 4xx
     /// (gateway, auth, throttling and request-shape rejections, including 408
     /// and 429) never reached the matching engine, while 5xx may have. Errors
     /// raised locally before anything was sent (`Auth`,

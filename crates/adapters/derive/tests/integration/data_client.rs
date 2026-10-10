@@ -1237,7 +1237,7 @@ async fn test_initial_retry_task_keeps_reconnecting_after_terminal_stream_failur
     ws_state.force_disconnect().await;
 
     // The retry task observes the closed stream, falls back to its outer
-    // loop, and dials a fresh WebSocket connection again — a second attempt
+    // loop, and dials a fresh WebSocket connection again - a second attempt
     // beyond the transport's own reconnect.
     wait_until_async(
         || {
@@ -1267,7 +1267,7 @@ async fn test_initial_retry_task_restores_quote_subscription_after_terminal_stre
     // which only proves the retry task dials again. A fresh `connect()`
     // tears down the old transport's desired-subscription set entirely
     // (unlike an in-place reconnect, which replays it automatically), so
-    // dialling again is not enough on its own: without replaying active
+    // dialing again is not enough on its own: without replaying active
     // channels from the data client's own subscription registry, the socket
     // reconnects with no ticker subscription and WS quote data never
     // resumes for the rest of the process.
