@@ -494,15 +494,23 @@ averages are available, and the earliest native creation timestamp as the accept
 
 #### Startup reconciliation
 
-Before private streaming starts, the execution client publishes account state. It loads instrument definitions
-required by the native portfolio and cached active orders. It waits for the engine cache to observe those
-definitions before private streaming starts. It restores owned active order context from cached order events,
-including known venue IDs and processed trade IDs, then verifies active orders against native open orders and
-history for their instruments. Historical metadata gaps do not prevent this binding check.
+For an intentional fresh start after closing all positions and orders, set
+`DeriveExecutionClientConfig.reconciliation_start_time_ms` to the verified flat baseline's
+UNIX millisecond timestamp. Only use this boundary with no cached execution state from before
+that timestamp. Startup, reconnect, and history report requests retain the same fixed boundary;
+current open orders and positions are always read without a time filter. Failed sources and
+missing order evidence within the retained history still fail mass-status reconciliation, even
+when a bounded lookback is also requested. A boundary in the future is rejected before querying
+history. Leave it unchanged across restarts so subsequent executions remain recoverable.
 
-After private subscription confirmation, it refreshes account state and required instrument definitions again
-before processing stream updates. This closes the interval between the initial portfolio snapshot and
-subscription confirmation.
+Before private streaming starts, the execution client publishes account state, loads instrument
+definitions required by the native portfolio and cached active orders, and waits for the engine
+cache to observe them. It restores owned active order context from cached order events, including
+known venue IDs and processed trade IDs, then verifies active orders against native open orders
+and history for their instruments. Historical metadata gaps do not prevent this binding check.
+After private subscription confirmation, it refreshes account state and required
+instrument definitions again before processing stream updates. This closes the interval between
+the initial portfolio snapshot and subscription confirmation.
 
 When `private/get_order` returns `11006` for a known venue ID, the adapter searches paginated
 `private/get_order_history` for that exact ID. It does not infer an unproved replacement binding

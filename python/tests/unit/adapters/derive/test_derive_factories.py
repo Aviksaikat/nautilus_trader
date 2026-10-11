@@ -34,6 +34,18 @@ from nautilus_trader.model import AccountId
 from nautilus_trader.model import TraderId
 
 
+def test_execution_config_retains_fixed_reconciliation_boundary() -> None:
+    """
+    Expose the reset boundary through the Python execution config.
+    """
+    config = DeriveExecutionClientConfig(
+        reconciliation_start_time_ms=1_791_707_147_000,
+        max_fee_per_contract=Decimal(1000),
+    )
+    assert config.reconciliation_start_time_ms == 1_791_707_147_000
+    assert DeriveExecutionClientConfig().reconciliation_start_time_ms is None
+
+
 SMOKE_WALLET_ADDRESS = "0x0000000000000000000000000000000000000001"
 SMOKE_SESSION_KEY = "0x0000000000000000000000000000000000000000000000000000000000000001"
 derive_exec_tester = load_example_module("derive", "exec_tester")

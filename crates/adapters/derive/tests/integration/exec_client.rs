@@ -1290,6 +1290,7 @@ fn test_config(rest: SocketAddr, ws: SocketAddr) -> DeriveExecutionClientConfig 
         wallet_address: Some(TEST_WALLET.to_string()),
         session_key: Some(TEST_SESSION_KEY.into()),
         subaccount_id: Some(TEST_SUBACCOUNT),
+        reconciliation_start_time_ms: None,
         base_url_rest: Some(rest_url(rest)),
         base_url_ws: Some(ws_url(ws)),
         proxy_url: None,
@@ -7555,7 +7556,16 @@ async fn test_balance_subscription_refreshes_authoritative_account_state(
 }
 
 async fn build_report_client(rest_state: RestState, ws_state: WsState) -> TestClient {
-    let tc = build_client(rest_state, ws_state).await;
+    build_report_client_with_config(rest_state, ws_state, None, |config| config).await
+}
+
+async fn build_report_client_with_config(
+    rest_state: RestState,
+    ws_state: WsState,
+    registry: Option<&SocketReconnectRegistry>,
+    configure: impl FnOnce(DeriveExecutionClientConfig) -> DeriveExecutionClientConfig,
+) -> TestClient {
+    let tc = build_client_with_config(rest_state, ws_state, registry, configure).await;
     let mut definitions = Vec::new();
 
     for symbol in ["ETH-PERP", "BTC-PERP", "SOL-PERP"] {
@@ -10158,6 +10168,300 @@ async fn test_generate_mass_status_without_lookback_omits_time_window() {
     assert!(position_calls[0].get("from_timestamp").is_none());
 
     tc.client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[case::legacy_history(None)]
+#[case::flat_reset(Some(1_700_000_003_000))]
+#[tokio::test]
+async fn test_mass_status_reset_excludes_legacy_orphan_fills(#[case] reset: Option<u64>) {
+    let rest = RestState::default();
+    *rest.open_orders_response.lock().await =
+        json!({"orders": [], "subaccount_id": TEST_SUBACCOUNT});
+    *rest.positions_response.lock().await =
+        json!({"positions": [], "subaccount_id": TEST_SUBACCOUNT});
+    *rest.trade_history_response.lock().await = json!({
+        "trades": [sample_trade_json("legacy-fill", "missing-legacy-order", "ETH-PERP")],
+        "pagination": {"count": 1, "num_pages": 1}, "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let mut tc =
+        build_report_client_with_config(rest.clone(), WsState::default(), None, |mut config| {
+            config.reconciliation_start_time_ms = reset;
+            config
+        })
+        .await;
+    tc.client.connect().await.unwrap();
+    let result = tc.client.generate_mass_status(None).await;
+    tc.client.disconnect().await.unwrap();
+
+    if let Some(start_ms) = reset {
+        let mass = result.unwrap().unwrap();
+        assert!(mass.reports_complete());
+        assert!(mass.order_reports().is_empty());
+        assert!(mass.fill_reports().is_empty());
+        assert!(mass.position_reports().is_empty());
+        assert_eq!(
+            mass.lookback_start(),
+            Some(UnixNanos::from_millis(start_ms))
+        );
+        assert_eq!(
+            rest.order_history_calls.lock().await[0]["from_timestamp"],
+            json!(start_ms)
+        );
+        assert_eq!(
+            rest.trade_history_calls.lock().await[0]["from_timestamp"],
+            json!(start_ms)
+        );
+    } else {
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "incomplete unbounded Derive report coverage"
+        );
+    }
+    assert!(
+        rest.open_orders_calls.lock().await[0]
+            .get("from_timestamp")
+            .is_none()
+    );
+    assert!(
+        rest.positions_calls.lock().await[0]
+            .get("from_timestamp")
+            .is_none()
+    );
+}
+
+#[rstest]
+#[case::order_history(0)]
+#[case::fills(1)]
+#[case::positions(2)]
+#[case::open_orders(3)]
+#[case::orphan_fill(4)]
+#[tokio::test]
+async fn test_mass_status_reset_keeps_sources_strict(
+    #[case] source: u8,
+    #[values(None, Some(10_000_000))] lookback: Option<u64>,
+) {
+    let rest = RestState::default();
+    *rest.open_orders_response.lock().await =
+        json!({"orders": [], "subaccount_id": TEST_SUBACCOUNT});
+    *rest.positions_response.lock().await =
+        json!({"positions": [], "subaccount_id": TEST_SUBACCOUNT});
+    let error = json!({"id": 1, "error": {"code": -32602, "message": "source unavailable"}});
+    match source {
+        0 => *rest.order_history_response.lock().await = error,
+        1 => *rest.trade_history_response.lock().await = error,
+        2 => *rest.positions_response.lock().await = error,
+        3 => *rest.open_orders_response.lock().await = error,
+        4 => {
+            *rest.trade_history_response.lock().await = json!({
+                "trades": [sample_trade_json("new-fill", "missing-new-order", "ETH-PERP")],
+                "pagination": {"count": 1, "num_pages": 1}, "subaccount_id": TEST_SUBACCOUNT,
+            });
+        }
+        _ => unreachable!(),
+    }
+    let mut tc = build_report_client_with_config(rest, WsState::default(), None, |mut config| {
+        config.reconciliation_start_time_ms = Some(1_700_000_000_000);
+        config
+    })
+    .await;
+    tc.client.connect().await.unwrap();
+    let error = tc.client.generate_mass_status(lookback).await.unwrap_err();
+    tc.client.disconnect().await.unwrap();
+
+    if source == 4 {
+        assert_eq!(error.to_string(), "incomplete reset Derive report coverage");
+    } else {
+        assert!(matches!(
+            error.downcast_ref::<DeriveHttpError>(),
+            Some(DeriveHttpError::JsonRpc { code: -32602, .. })
+        ));
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_mass_status_reset_preserves_current_exposure_before_boundary() {
+    let rest = RestState::default();
+    *rest.open_orders_response.lock().await = json!({
+        "orders": [sample_order_json()], "subaccount_id": TEST_SUBACCOUNT,
+    });
+    *rest.positions_response.lock().await = json!({
+        "positions": [sample_position_json("ETH-PERP", "0.3")], "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let mut tc =
+        build_report_client_with_config(rest.clone(), WsState::default(), None, |mut config| {
+            config.reconciliation_start_time_ms = Some(1_700_000_003_000);
+            config
+        })
+        .await;
+    tc.client.connect().await.unwrap();
+    let mass = tc.client.generate_mass_status(None).await.unwrap().unwrap();
+    tc.client.disconnect().await.unwrap();
+    assert_eq!(mass.order_reports().len(), 1);
+    assert_eq!(
+        mass.position_reports()[&InstrumentId::from("ETH-PERP.DERIVE")][0].signed_decimal_qty,
+        dec!(0.3)
+    );
+    assert!(
+        rest.open_orders_calls.lock().await[0]
+            .get("from_timestamp")
+            .is_none()
+    );
+    assert!(
+        rest.positions_calls.lock().await[0]
+            .get("from_timestamp")
+            .is_none()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_reconnect_mass_status_uses_fixed_reset_boundary() {
+    let rest = RestState::default();
+    *rest.open_orders_response.lock().await =
+        json!({"orders": [], "subaccount_id": TEST_SUBACCOUNT});
+    *rest.positions_response.lock().await =
+        json!({"positions": [], "subaccount_id": TEST_SUBACCOUNT});
+    *rest.trade_history_response.lock().await = json!({
+        "trades": [sample_trade_json("legacy-fill", "missing-legacy-order", "ETH-PERP")],
+        "pagination": {"count": 1, "num_pages": 1}, "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let registry = SocketReconnectRegistry::default();
+    let start_ms = 1_700_000_003_000;
+    let mut tc = build_report_client_with_config(
+        rest.clone(),
+        WsState::default(),
+        Some(&registry),
+        |mut config| {
+            config.reconciliation_start_time_ms = Some(start_ms);
+            config
+        },
+    )
+    .await;
+    let (time_sender, mut time_events) = tokio::sync::mpsc::unbounded_channel();
+    set_time_event_sender(Arc::new(ReconciliationTimeSender(time_sender)));
+    tc.client.connect().await.unwrap();
+    drain_initial_account_state(&mut tc).await;
+    assert_eq!(
+        registry
+            .handle(ClientId::from("DERIVE"), Ustr::from("derive-user-streams"))
+            .unwrap()
+            .request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted,
+    );
+    let mass = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                message = time_events.recv() => assert!(message.unwrap().dispatch()),
+                event = tc.rx.recv() => {
+                    if let Some(ExecutionEvent::Report(ExecutionReport::MassStatus(status))) = event {
+                        break status;
+                    }
+                }
+            }
+        }
+    }).await.unwrap();
+    tc.client.disconnect().await.unwrap();
+    assert!(mass.reports_complete());
+    assert!(mass.fill_reports().is_empty());
+    assert_eq!(
+        mass.lookback_start(),
+        Some(UnixNanos::from_millis(start_ms))
+    );
+    assert_eq!(
+        rest.order_history_calls.lock().await[0]["from_timestamp"],
+        json!(start_ms)
+    );
+    assert_eq!(
+        rest.trade_history_calls.lock().await[0]["from_timestamp"],
+        json!(start_ms)
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_mass_status_reset_rejects_future_boundary_before_queries() {
+    let rest = RestState::default();
+    let start_ms = get_atomic_clock_realtime().get_time_ns().as_millis() + 60_000;
+    let mut tc =
+        build_report_client_with_config(rest.clone(), WsState::default(), None, |mut config| {
+            config.reconciliation_start_time_ms = Some(start_ms);
+            config
+        })
+        .await;
+    tc.client.connect().await.unwrap();
+    let error = tc.client.generate_mass_status(None).await.unwrap_err();
+    tc.client.disconnect().await.unwrap();
+    assert_eq!(
+        error.to_string(),
+        "Derive reconciliation_start_time_ms is in the future"
+    );
+    assert!(rest.order_history_calls.lock().await.is_empty());
+    assert!(rest.trade_history_calls.lock().await.is_empty());
+    assert!(rest.positions_calls.lock().await.is_empty());
+}
+
+#[rstest]
+#[case::unbounded(None, 1_700_000_003_000)]
+#[case::earlier(Some(1_700_000_000_000), 1_700_000_003_000)]
+#[case::later(Some(1_700_000_004_000), 1_700_000_004_000)]
+#[tokio::test]
+async fn test_report_queries_retain_fixed_reset_boundary(
+    #[case] requested_start_ms: Option<u64>,
+    #[case] expected_start_ms: u64,
+) {
+    let rest = RestState::default();
+    *rest.trade_history_response.lock().await = json!({
+        "trades": [sample_trade_json("legacy-fill", "legacy-order", "ETH-PERP")],
+        "pagination": {"count": 1, "num_pages": 1}, "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let mut tc =
+        build_report_client_with_config(rest.clone(), WsState::default(), None, |mut config| {
+            config.reconciliation_start_time_ms = Some(1_700_000_003_000);
+            config
+        })
+        .await;
+    tc.client.connect().await.unwrap();
+    let ts_now = get_atomic_clock_realtime().get_time_ns();
+    let start = requested_start_ms.map(UnixNanos::from_millis);
+    tc.client
+        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+            UUID4::new(),
+            ts_now,
+            false,
+            None,
+            start,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let fills = tc
+        .client
+        .generate_fill_reports(GenerateFillReports::new(
+            UUID4::new(),
+            ts_now,
+            None,
+            None,
+            start,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    tc.client.disconnect().await.unwrap();
+    assert!(fills.is_empty());
+    assert_eq!(
+        rest.order_history_calls.lock().await[0]["from_timestamp"],
+        json!(expected_start_ms)
+    );
+    assert_eq!(
+        rest.trade_history_calls.lock().await[0]["from_timestamp"],
+        json!(expected_start_ms)
+    );
 }
 
 #[rstest]

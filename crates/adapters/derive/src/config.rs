@@ -170,6 +170,14 @@ pub struct DeriveExecutionClientConfig {
     /// Subaccount identifier. Falls back to `DERIVE_SUBACCOUNT_ID` (or
     /// `DERIVE_TESTNET_SUBACCOUNT_ID` on testnet) when unset.
     pub subaccount_id: Option<u64>,
+    /// Earliest reconciliation history timestamp, in UNIX milliseconds.
+    ///
+    /// Set only after establishing a flat account baseline with no open orders
+    /// and no cached execution state predating this timestamp. Current open
+    /// orders and positions are always queried without this history filter.
+    /// Startup, reconnect, and report queries retain this fixed boundary;
+    /// source failures and missing order evidence remain fatal when configured.
+    pub reconciliation_start_time_ms: Option<u64>,
     /// The Derive environment to connect to.
     #[builder(default)]
     pub environment: DeriveEnvironment,
@@ -244,6 +252,7 @@ nautilus_core::impl_pyo3_config_getters!(DeriveExecutionClientConfig {
     account_id: AccountId,
     wallet_address: Option<String>,
     subaccount_id: Option<u64>,
+    reconciliation_start_time_ms: Option<u64>,
     environment: DeriveEnvironment,
     base_url_rest: Option<String>,
     base_url_ws: Option<String>,
@@ -301,6 +310,7 @@ impl DeriveExecutionClientConfig {
     /// Returns an error if:
     /// - `max_fee_per_contract` is missing or not greater than zero.
     /// - Cancel-on-disconnect uses a signature expiry greater than 15 minutes.
+    /// - The reconciliation start cannot be represented in nanoseconds.
     pub fn validate(&self) -> anyhow::Result<()> {
         let Some(max_fee_per_contract) = self.max_fee_per_contract else {
             anyhow::bail!("max_fee_per_contract is required");
@@ -313,6 +323,13 @@ impl DeriveExecutionClientConfig {
         if self.cancel_on_disconnect && self.signature_expiry_secs > 15 * 60 {
             anyhow::bail!(
                 "cancel_on_disconnect requires signature_expiry_secs at most 900 seconds"
+            );
+        }
+
+        if let Some(start) = self.reconciliation_start_time_ms {
+            anyhow::ensure!(
+                start.checked_mul(1_000_000).is_some(),
+                "reconciliation_start_time_ms cannot be represented in nanoseconds",
             );
         }
 
@@ -445,6 +462,7 @@ mod tests {
         assert_eq!(config.environment, DeriveEnvironment::Mainnet);
         assert_eq!(config.http_timeout_secs, 10);
         assert_eq!(config.max_retries, 3);
+        assert_eq!(config.reconciliation_start_time_ms, None);
         assert!(config.max_matching_requests_per_second.is_none());
         assert!(
             config
@@ -482,6 +500,18 @@ mod tests {
                 "cancel_on_disconnect requires signature_expiry_secs at most 900 seconds"
             );
         }
+    }
+
+    #[rstest]
+    #[case::maximum_representable(u64::MAX / 1_000_000, true)]
+    #[case::overflow(u64::MAX / 1_000_000 + 1, false)]
+    fn test_exec_config_reset_boundary_range(#[case] start: u64, #[case] valid: bool) {
+        let config = DeriveExecutionClientConfig {
+            reconciliation_start_time_ms: Some(start),
+            max_fee_per_contract: Some(Decimal::ONE),
+            ..DeriveExecutionClientConfig::default()
+        };
+        assert_eq!(config.validate().is_ok(), valid);
     }
 
     #[rstest]
