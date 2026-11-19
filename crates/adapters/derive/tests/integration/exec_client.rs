@@ -2327,6 +2327,67 @@ async fn test_exec_client_reconnect_refreshes_account_and_submits_mass_status(
     tc.client.disconnect().await.expect("disconnect succeeds");
 }
 
+#[tokio::test]
+async fn test_exec_client_reconnect_reuses_startup_lookback() {
+    let rest_state = RestState::default();
+    *rest_state.open_orders_response.lock().await =
+        json!({"orders": [], "subaccount_id": TEST_SUBACCOUNT});
+    let ws_state = WsState::default();
+    let registry = SocketReconnectRegistry::default();
+    let mut tc =
+        build_client_with_config(rest_state.clone(), ws_state, Some(&registry), |config| {
+            config
+        })
+        .await;
+
+    tc.client.connect().await.expect("connect succeeds");
+    drain_initial_account_state(&mut tc).await;
+    tc.client
+        .generate_mass_status(Some(10_080))
+        .await
+        .expect("startup mass status succeeds");
+
+    let reconnect = registry
+        .handle(ClientId::from("DERIVE"), Ustr::from("derive-user-streams"))
+        .unwrap()
+        .request_reconnect();
+    assert_eq!(reconnect, SocketReconnectRequestOutcome::Accepted);
+
+    let event = drain_until(
+        &mut tc.rx,
+        |event| {
+            matches!(
+                event,
+                ExecutionEvent::Report(ExecutionReport::MassStatus(_))
+            )
+        },
+        "bounded post-reconnect mass status",
+    )
+    .await;
+    let ExecutionEvent::Report(ExecutionReport::MassStatus(status)) = event else {
+        unreachable!();
+    };
+
+    assert_eq!(
+        status.lookback_start(),
+        Some(
+            status
+                .ts_init
+                .saturating_sub(DurationNanos::try_from_mins(10_080).unwrap())
+        ),
+    );
+    let order_history_calls = rest_state.order_history_calls.lock().await;
+    let trade_history_calls = rest_state.trade_history_calls.lock().await;
+    assert_eq!(order_history_calls.len(), 2);
+    assert_eq!(trade_history_calls.len(), 2);
+    assert!(order_history_calls[1].get("from_timestamp").is_some());
+    assert!(trade_history_calls[1].get("from_timestamp").is_some());
+    drop(order_history_calls);
+    drop(trade_history_calls);
+
+    tc.client.disconnect().await.expect("disconnect succeeds");
+}
+
 #[derive(Debug)]
 struct ReconciliationTimeSender(tokio::sync::mpsc::UnboundedSender<TimeEventMessage>);
 

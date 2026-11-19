@@ -172,6 +172,7 @@ pub struct DeriveExecutionClient {
     shutdown_errors: Vec<String>,
     dispatch_state: Arc<WsDispatchState>,
     reconciliation_request: Mutex<Option<ReconciliationSnapshotRequest>>,
+    reconciliation_lookback_mins: Arc<Mutex<Option<u64>>>,
 }
 
 impl DeriveExecutionClient {
@@ -274,6 +275,7 @@ impl DeriveExecutionClient {
             shutdown_errors: Vec::new(),
             dispatch_state,
             reconciliation_request: Mutex::new(None),
+            reconciliation_lookback_mins: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -552,6 +554,7 @@ impl DeriveExecutionClient {
             terminal_revision,
             report_observations: None,
             load_ids: self.config.load_ids.clone(),
+            reconciliation_lookback_mins: Arc::clone(&self.reconciliation_lookback_mins),
         }
     }
 
@@ -1365,6 +1368,9 @@ impl ExecutionClient for DeriveExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        if let Some(lookback_mins) = lookback_mins {
+            *self.reconciliation_lookback_mins.lock() = Some(lookback_mins);
+        }
         let ts_init = self.clock.get_time_ns();
         Box::pin(
             self.reconciliation_context()
@@ -2781,6 +2787,7 @@ struct DeriveReconciliationContext {
     terminal_revision: Arc<()>,
     report_observations: Option<Arc<Mutex<ReportObservations>>>,
     load_ids: Option<Vec<InstrumentId>>,
+    reconciliation_lookback_mins: Arc<Mutex<Option<u64>>>,
 }
 
 impl DeriveReconciliationContext {
@@ -2804,7 +2811,9 @@ impl DeriveReconciliationContext {
 
     async fn recover_after_reconnect(&self, ts_init: UnixNanos) -> anyhow::Result<()> {
         self.refresh_account_state().await?;
-        let mass_status = Box::pin(self.generate_mass_status(None, ts_init, false)).await?;
+        let lookback_mins = *self.reconciliation_lookback_mins.lock();
+        let mass_status =
+            Box::pin(self.generate_mass_status(lookback_mins, ts_init, false)).await?;
         let order_count = mass_status.order_reports().len();
         let fill_count: usize = mass_status.fill_reports().values().map(Vec::len).sum();
         let position_count = mass_status.position_reports().len();
